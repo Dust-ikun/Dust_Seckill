@@ -5,9 +5,6 @@ import com.dustikun.seckill.Service.SeckillService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.*;
 
-import java.util.HashMap;
-import java.util.Map;
-
 @RestController
 @RequestMapping("/seckill")
 public class SeckillController {

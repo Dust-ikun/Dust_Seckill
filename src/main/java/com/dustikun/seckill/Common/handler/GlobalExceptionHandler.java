@@ -3,7 +3,6 @@ package com.dustikun.seckill.Common.handler;
 import com.dustikun.seckill.Common.Exception.BizException;
 import com.dustikun.seckill.Common.result.Result;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.http.converter.feed.RssChannelHttpMessageConverter;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 

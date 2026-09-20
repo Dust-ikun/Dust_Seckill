@@ -2,11 +2,9 @@ package com.dustikun.seckill.Service;
 
 import com.dustikun.seckill.Common.Exception.BizException;
 import com.dustikun.seckill.Common.Exception.ErrorCode;
-import com.dustikun.seckill.Common.result.Result;
 import com.dustikun.seckill.Mapper.OrderMapper;
 import com.dustikun.seckill.Mapper.StockMapper;
 import com.dustikun.seckill.entity.Order;
-import com.dustikun.seckill.entity.Stock;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
