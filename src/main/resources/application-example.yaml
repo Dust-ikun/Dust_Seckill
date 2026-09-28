@@ -16,13 +16,68 @@ spring:
     redis:
       host: localhost
       port: 6379
+      timeout: 2000ms
+      connect-timeout: 2000ms
       lettuce:
         pool:
-          enabled: true
-          max-active: 50
-          max-idle: 20
-          min-idle: 5
-          max-wait: 3000ms
-  mybatis:
-    configuration:
-      map-underscore-to-camel-case: true
+          # 秒杀场景下 Redis 命令是纯内存操作，连接数要足够大，避免请求线程排队等连接
+          max-active: 200
+          max-idle: 50
+          min-idle: 10
+          max-wait: 1000ms
+# ----------------------------------------------------------------------------
+# MyBatis 配置。
+#
+# 【为什么必须放在顶层】前缀是 mybatis，不是 spring.mybatis。
+# mybatis-spring-boot-starter 只识别 mybatis.*；写成 spring.mybatis.* 既不报错也不生效，
+# 结果是所有下划线列名静默映射不上（order_no / user_id / stock_id → null）。
+# 这类缺陷不抛异常，只在下游拿 null 做决策时才暴露，比想象中难查得多。
+# ----------------------------------------------------------------------------
+mybatis:
+  configuration:
+    map-underscore-to-camel-case: true
+
+seckill:
+  # Snowflake 机器位（0~1023）。多实例部署时每个实例必须配置不同的值，否则单号会重复
+  worker-id: 0
+
+  # ---------------- 阶段 4：RocketMQ 异步落库 ----------------
+  mq:
+    # 置为 false 时退化为「Redis 预扣 + 同步落库」，可在本机未启动 Broker 时调试其它功能
+    enabled: true
+    name-server: 127.0.0.1:9876
+    producer-group: seckill-producer-group
+    consumer-group: seckill-order-consumer-group
+    topic: seckill-order-topic
+    tag: create-order
+    send-timeout-ms: 3000
+    max-reconsume-times: 3
+    consume-thread-min: 4
+    consume-thread-max: 8
+
+  # ---------------- 阶段 4 评审修复：后台维护任务 ----------------
+  # 待补偿任务重试 + 库存对账。
+  maintenance:
+    enabled: true
+    compensate:
+      interval-ms: 30000          # 待补偿任务扫描间隔
+      batch-size: 100
+      first-retry-delay-seconds: 10
+      max-retry: 10               # 超过则标记 FAILED，等人工介入
+    reconcile:
+      interval-ms: 300000         # 对账间隔（5 分钟）
+      auto-repair: false          # 默认只告警不改数据
+      stock-ids: 1                # 纳入自动对账的活动 ID（逗号分隔），留空则只支持手动对账
+
+  # ---------------- 阶段 5：本地消息表（Outbox） ----------------
+  # 请求线程在 Redis 预扣后先写 seckill_outbox 再返回，后台投递器再把它投进 MQ。
+  # 收益：Broker 不可用不再等于用户丢单；「已受理但未投出」的规模变成可查询的数据库状态。
+  outbox:
+    enabled: true                 # false 时回退到阶段 4 的同步投递行为
+    dispatch-interval-ms: 1000    # 投递器轮询间隔，决定「落库 → 进 MQ」的额外延迟
+    batch-size: 500               # 单轮投递上限；批量发送后它直接决定投递吞吐（约 batch-size / 秒）
+    max-retry: 15                 # 投递重试上限，用尽则回补 Redis 预扣并标记 FAILED
+    first-retry-delay-seconds: 2  # 首次失败后的退避起点，之后指数退避，上限 5 分钟
+    purge-interval-ms: 600000     # 归档清理间隔
+    retention-hours: 24           # 已投递记录的保留时长
+    purge-batch-size: 1000        # 归档每批删除条数，避免长事务

@@ -35,8 +35,25 @@
             <artifactId>spring-boot-starter-data-redis</artifactId>
         </dependency>
         <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-pool2</artifactId>
+        </dependency>
+        <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-webmvc</artifactId>
+        </dependency>
+
+        <!--
+          阶段 4：RocketMQ 客户端。
+          这里刻意只引入原生客户端 rocketmq-client，不引入 rocketmq-spring-boot-starter：
+          本项目是 Spring Boot 4.0.8（Spring Framework 7），而 starter 目前最高适配 Spring Boot 3.x，
+          引入后会因框架 API 变更导致启动失败。改用原生客户端 + 手写 RocketMqConfig 管理生命周期，
+          既能规避版本兼容问题，也让生产者/消费者的启动与关闭过程完全可控。
+        -->
+        <dependency>
+            <groupId>org.apache.rocketmq</groupId>
+            <artifactId>rocketmq-client</artifactId>
+            <version>5.3.2</version>
         </dependency>
         <dependency>
             <groupId>org.mybatis.spring.boot</groupId>
@@ -58,10 +75,6 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-data-redis-test</artifactId>
             <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>org.apache.commons</groupId>
-            <artifactId>commons-pool2</artifactId>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>

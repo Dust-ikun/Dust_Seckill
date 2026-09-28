@@ -32,4 +32,16 @@ build/
 ### VS Code ###
 .vscode/
 
+### WorkBuddy ###
+# 本地工具链（便携版 Redis 等）与工作记录，不纳入版本控制
+.workbuddy/
+
+### 飞书文档创作脚手架（lark-cli 自动生成的中间工作区）###
+draft_*/
+
+### 本地文档与压测产物，不纳入版本控制 ###
+docs/
+jmeter.log
+*.log
+
 src/main/resources/application.yaml
