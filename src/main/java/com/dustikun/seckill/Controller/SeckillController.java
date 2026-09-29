@@ -81,14 +81,16 @@ public class SeckillController {
      * Redis 故障期间的降级写库、以及 Redis 响应超时造成的假阴性。
      * 两者都无法靠事后补偿修复，只能靠比对真实状态发现。
      *
-     * @param expectedInFlight 调用方声明的在途预扣数（已投递未落库的消息数）。
-     *                         确认没有在途消息时传 0；不确定时可先用 {@code /metrics} 估算。
+     * @param expectedInFlight 在途预扣数（已投递未落库的消息数）。
+     *                         <b>默认 -1 = 自动模式</b>：按「数据库库存 − PENDING 预订单数」
+     *                         从数据库直接算出，不需要人工判断（订单前置之后在途有了数据库事实）。
+     *                         传 >= 0 可显式覆盖（MANUAL 模式），用于「我明知有 N 条在途」的场景。
      * @param repair           true 时执行修复（把 Redis 校准到「数据库 − 在途」、补齐缺失的已购标记）。
      *                         默认 false：只报告不动数据，避免在不知情的情况下改写线上状态。
      */
     @GetMapping("/reconcile")
     public Result<?> reconcile(@RequestParam Long stockId,
-                               @RequestParam(defaultValue = "0") long expectedInFlight,
+                               @RequestParam(defaultValue = "-1") long expectedInFlight,
                                @RequestParam(defaultValue = "false") boolean repair) {
         ReconcileReport report = stockReconcileService.reconcile(stockId, expectedInFlight, repair);
         return Result.success(report.conclusion(), report);

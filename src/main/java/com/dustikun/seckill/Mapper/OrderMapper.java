@@ -89,4 +89,25 @@ public interface OrderMapper {
      */
     @Select("SELECT COUNT(*) FROM orders WHERE stock_id = #{stockId} AND status = 'PENDING'")
     int countPendingByStockId(@Param("stockId") Long stockId);
+
+    /**
+     * 对账快照：一条 SQL 同时取回「数据库库存 / PENDING 预订单数 / 订单总数」。
+     * <p>
+     * 对账的不变量是 {@code Redis 库存 == 数据库库存 − 在途预扣数}，等式两边的数据库侧
+     * 必须来自同一时刻——分成两条查询时，间隙里落库的订单会自己制造假不一致。
+     * 标量子查询在同一个语句里读到的是同一份一致性视图，天然满足这一点。
+     * <p>
+     * 【为什么用 PENDING 订单数做在途数】订单前置之后，每一笔受理都会留下一条
+     * PENDING 预订单，消费确认（PENDING → CONFIRMED + 扣库存）在同一事务里完成，
+     * 所以「Redis 已扣、数据库尚未扣」的差额恰好等于 PENDING 行数——
+     * 在途不再是 JVM 计数器或人工声明，而是可以直接查库的事实。
+     * <p>
+     * 快照里只有数据库：Redis 侧的库存在本方法之外单独读取
+     * （它本来就不是数据库事务的一部分，且注意先取快照后读 Redis 的读偏斜窗口，见对账服务注释）。
+     */
+    @Select("SELECT"
+            + " (SELECT count FROM stock WHERE id = #{stockId}) AS dbStock,"
+            + " (SELECT COUNT(*) FROM orders WHERE stock_id = #{stockId} AND status = 'PENDING') AS pendingOrders,"
+            + " (SELECT COUNT(*) FROM orders WHERE stock_id = #{stockId}) AS dbOrderCount")
+    com.dustikun.seckill.Common.result.ReconcileSnapshot selectReconcileSnapshot(@Param("stockId") Long stockId);
 }

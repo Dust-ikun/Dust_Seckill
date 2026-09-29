@@ -282,6 +282,49 @@ class SeckillReviewFixTest {
         assertFalse(stockCacheService.isBought(STOCK_ID, 800006L), "没有订单的用户不该被误标");
     }
 
+    // ================================================================ 对账改进：在途数自动计算
+
+    @Test
+    @DisplayName("对账改进：在途数可由 PENDING 预订单自动计算，不再依赖人工声明")
+    void reconcileShouldAutoComputeInFlightFromPendingOrders() {
+        stockCacheService.preheat(STOCK_ID);          // Redis = 100, stock.count = 100
+
+        // 模拟一笔正常受理的中间态：Redis 已预扣 1 件，orders 里留下一条 PENDING 预订单
+        long userId = 800010L;
+        stockCacheService.tryDeduct(STOCK_ID, userId, 1);   // Redis = 99
+        Order pending = new Order();
+        pending.setOrderNo("RVT-AUTO-1");
+        pending.setUserId(userId);
+        pending.setStockId(STOCK_ID);
+        pending.setStatus(Order.STATUS_PENDING);
+        pending.setCreateTime(LocalDateTime.now());
+        orderMapper.insert(pending);
+
+        // 自动模式：期望值 = 数据库库存(100) − PENDING(1) = 99，与 Redis 相等 → 一致。
+        // 在途不再需要人工声明，正常中间态不会被误报。
+        ReconcileReport auto = stockReconcileService.reconcile(STOCK_ID, false);
+        assertEquals(ReconcileReport.Status.CONSISTENT, auto.status(),
+                "在途按数据库 PENDING 自动计算后，受理中的订单不应被误报为不一致");
+        assertEquals(ReconcileReport.InFlightSource.AUTO, auto.inFlightSource());
+        assertEquals(1, auto.pendingOrders());
+
+        // 对照：同一状态若仍按「无在途」人工声明（0），会被误报成 REDIS_BEHIND——
+        // 这正是自动模式要消除的人工判断负担
+        ReconcileReport manual = stockReconcileService.reconcile(STOCK_ID, 0L, false);
+        assertEquals(ReconcileReport.Status.REDIS_BEHIND, manual.status(),
+                "忽略在途时，正常中间态必然被误报——证明 AUTO 判据确实用上了 PENDING");
+        assertEquals(ReconcileReport.InFlightSource.MANUAL, manual.inFlightSource());
+
+        // 真泄漏在自动模式下依然可判：Redis 再凭空少 1（没有对应的订单记录）。
+        // 期望值 99 已经放宽到「算上全部在途」，仍差 1 → 泄漏，不再是「正常的中间状态」。
+        redisTemplate.opsForValue().set(SeckillRedisKeys.stock(STOCK_ID), "98");
+        ReconcileReport leak = stockReconcileService.reconcile(STOCK_ID, false);
+        assertEquals(ReconcileReport.Status.REDIS_BEHIND, leak.status(),
+                "算上全部 PENDING 预订单仍对不上，说明存在绕过订单记录的预扣泄漏");
+        assertTrue(leak.conclusion().contains("泄漏"),
+                "AUTO 模式的结论应直接指认泄漏，而不是模棱两可的「中间状态」");
+    }
+
     // ================================================================ 评审问题 5 / 7
 
     @Test

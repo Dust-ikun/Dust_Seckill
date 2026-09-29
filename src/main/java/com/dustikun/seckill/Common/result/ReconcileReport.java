@@ -20,7 +20,9 @@ import java.util.List;
  * @param status             对账结论
  * @param redisStock         Redis 侧剩余库存；{@code null} 表示未预热
  * @param dbStock            数据库侧剩余库存
- * @param expectedInFlight   调用方声明的「在途预扣数」——已投递但尚未落库的消息数
+ * @param expectedInFlight   参与不变量计算的「在途预扣数」——来源见 {@code inFlightSource}
+ * @param inFlightSource     在途数的来源：数据库自动计算，或调用方显式声明
+ * @param pendingOrders      快照里的 PENDING 预订单数（AUTO 模式下即 inFlight 的取值来源）
  * @param redisBoughtCount   Redis 已购集合规模
  * @param dbOrderCount       数据库订单数
  * @param repaired           本次调用是否真的修改了数据
@@ -33,12 +35,28 @@ public record ReconcileReport(
         Integer redisStock,
         long dbStock,
         long expectedInFlight,
+        InFlightSource inFlightSource,
+        long pendingOrders,
         long redisBoughtCount,
         long dbOrderCount,
         boolean repaired,
         List<String> actions,
         String conclusion
 ) {
+
+    /**
+     * 在途预扣数的来源。
+     * <pre>
+     *   AUTO   —— 数据库自动计算：COUNT(orders WHERE stock_id=? AND status='PENDING')。
+     *            订单前置之后「在途」直接有了数据库事实，这是默认模式；
+     *   MANUAL —— 调用方显式传入（expectedInFlight >= 0）。保留它是为了覆盖
+     *            「我明知有 N 条在途、只想按这个数判」的场景，以及旧脚本兼容。
+     * </pre>
+     */
+    public enum InFlightSource {
+        AUTO,
+        MANUAL
+    }
 
     public enum Status {
         /** Redis 里没有这个活动的库存 key，对账无从谈起（应先预热） */
@@ -55,8 +73,10 @@ public record ReconcileReport(
         /**
          * Redis 库存 <b>小于</b>应有值。
          * <p>
-         * 可能是在途预扣（正常），也可能是预扣泄漏（少卖）。调用方若已确认没有在途消息，
-         * 那它就是泄漏。这是补偿逻辑照不到的第二个角落。
+         * AUTO 模式下这<b>基本可以确定</b>是异常：期望值已按「数据库库存 − 全部 PENDING 预订单」
+         * 放宽，即使算上所有在途仍对不上，只能是绕过订单记录的预扣泄漏（少卖）。
+         * 唯一的误报来源是读偏斜（Redis 恰好在快照之后、读数之前被扣，见对账服务类注释），
+         * 定时对账用排空门控规避；MANUAL 模式下它还可能是调用方少报了在途。
          */
         REDIS_BEHIND,
         /**

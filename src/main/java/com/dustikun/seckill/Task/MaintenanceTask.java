@@ -84,8 +84,12 @@ public class MaintenanceTask {
     /**
      * 库存对账。
      * <p>
-     * 只在「整条链路已经排空」时才做判断：只要 MQ 里还有在途消息，
-     * 「Redis 比数据库小」就是正常中间态，此时判断会把正常状态误报成泄漏。
+     * 在途数走<b>自动模式</b>（按「数据库库存 − PENDING 预订单数」计算，多实例也准确），
+     * 不再依赖排空后传 0：即使仍有在途，期望值也已把在途算进去，正常中间态不会被误报。
+     * <p>
+     * 排空门控仍然保留，但它防的对象变了——现在防的是<b>读偏斜</b>：
+     * 数据库快照与 Redis 读数之间的窗口里若恰好有一笔请求「已扣 Redis、还没插入 PENDING」，
+     * 会把正常中间态读成 REDIS_BEHIND(1)。排空后再对账，这个窗口自然关上。
      */
     @Scheduled(fixedDelayString = "${seckill.maintenance.reconcile.interval-ms:300000}")
     public void reconcileStocks() {
@@ -99,10 +103,10 @@ public class MaintenanceTask {
                     // 排空判断放到每个活动内部：不同活动的在途情况互不相同，
                     // 一个活动还没排空不该拖累其它活动的对账
                     if (!pipelineDrained(stockId)) {
-                        log.debug("[维护任务·对账] stockId={} 仍有在途，本次跳过（在途时 Redis 比 DB 小属正常）", stockId);
+                        log.debug("[维护任务·对账] stockId={} 仍有在途，本次跳过（防快照与 Redis 读数之间的读偏斜）", stockId);
                         continue;
                     }
-                    ReconcileReport report = stockReconcileService.reconcile(stockId, 0L, autoRepair);
+                    ReconcileReport report = stockReconcileService.reconcile(stockId, autoRepair);
                     if (!report.healthy() && report.status() != ReconcileReport.Status.NOT_PREHEATED) {
                         log.error("[维护任务·对账] stockId={} 判定为 {}：{}。修复动作={}",
                                 stockId, report.status(), report.conclusion(), report.actions());
@@ -120,10 +124,12 @@ public class MaintenanceTask {
     /**
      * 管道是否已排空。
      * <p>
-     * 两个条件都必须满足，缺一不可：
+     * 在途数改为数据库自动计算后，排空不再是「对账结果准确性」的必要条件
+     * （AUTO 模式的期望值天然把在途算进去），保留它是为了关上读偏斜窗口。
+     * 两个条件仍然都查：
      * <ol>
      *   <li><b>没有待投递记录</b>（阶段 5 新增）：还在 PENDING 的 outbox 记录意味着
-     *       这笔预扣确定尚未落库，此时判断对账必然误报。这一条查的是数据库，多实例也准确。</li>
+     *       这笔预扣确定尚未落库。这一条查的是数据库，多实例也准确。</li>
      *   <li><b>已投递的消息都已处理完</b>：这一步仍然只能靠单实例的 JVM 计数
      *       （MQ 的投递/消费进度无法从库里推出来）。要让它跨实例准确，
      *       需要消费端落库成功后回写 outbox 状态（计划在下一阶段做）。</li>
