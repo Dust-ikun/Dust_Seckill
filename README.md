@@ -102,7 +102,7 @@ src/main/resources/
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/seckill/metrics` | 运行态指标：请求侧 / 待投递侧（outbox\_*）/ MQ 投递侧 / 消费侧 / 补偿侧计数 |
-| GET | `/seckill/reconcile?stockId=&expectedInFlight=&repair=` | 库存对账。默认只报告；`repair=true` 会把 Redis 校准为「数据库 − 在途」，需确认在途估算准确后使用 |
+| GET | `/seckill/reconcile?stockId=&expectedInFlight=&repair=` | 库存对账。`expectedInFlight` 默认 `-1` = 自动模式：在途数按「数据库库存 − PENDING 预订单数」从库中直接算出，无需人工判断；传 `>=0` 可显式覆盖。默认只报告；`repair=true` 会把 Redis 校准为「数据库 − 在途」 |
 | GET | `/seckill/count` | 已受理下单数 |
 
 ### 压测对照端点（默认关闭）
