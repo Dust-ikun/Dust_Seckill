@@ -12,10 +12,10 @@ public interface StockMapper {
     Stock selectById(@Param("id") Long id);
 
     /**
-     * 数据库侧条件扣减（阶段 2 的防超卖方案，阶段 3 起降级为「持久化账本 + Redis 故障时的兜底路径」）。
+     * 数据库侧条件扣减（Redis 预扣的持久化账本，也是 Redis 故障时唯一的兜底路径）。
      * <p>
-     * 修正记录：条件由 {@code count > 0} 改为 {@code count >= #{num}}。
-     * 原写法仅当 num == 1 时才等价，一旦按 num > 1 扣减就会把库存扣成负数。
+     * 条件必须是 {@code count >= #{num}}：若写成 {@code count > 0}，
+     * 仅当 num == 1 时等价，一旦按 num > 1 扣减就会把库存扣成负数。
      */
     @Update("UPDATE stock SET count = count - #{num} WHERE id = #{id} AND count >= #{num}")
     int deduct(@Param("num") Long num, @Param("id") Long id);

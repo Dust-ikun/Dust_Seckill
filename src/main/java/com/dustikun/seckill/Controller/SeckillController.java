@@ -47,7 +47,7 @@ public class SeckillController {
     /**
      * 秒杀下单。
      * <p>
-     * 迁移第二步起返回语义仍是「已受理」，但含义更具体了：接口返回时数据库里已经有一条
+     * 返回语义是「已受理」，含义很具体：接口返回时数据库里已经有一条
      * <b>PENDING 预订单</b>和一条待投递凭据（两者同一事务），库存扣减与订单确认由消费线程接力。
      * 客户端需要拿 {@code orderNo} 轮询 {@code /seckill/order/status} 才能知道最终结果。
      * <p>
@@ -153,7 +153,7 @@ public class SeckillController {
         metrics.put("restoreStockOnly", seckillService.getRestoreStockOnlyCount());
         metrics.put("syncSuccess", seckillService.getSuccessCount());
 
-        // ---- 待投递侧（阶段 5）----
+        // ---- 待投递侧 ----
         // outboxPending 是「已受理但消息还没进 Broker」的真实欠账规模，
         // 它查的是数据库，因此多实例部署下依然准确 —— 这一点优于下面的 JVM 计数器。
         metrics.put("outboxEnqueued", outboxService.getEnqueuedCount());

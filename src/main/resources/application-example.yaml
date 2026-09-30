@@ -41,7 +41,7 @@ seckill:
   # Snowflake 机器位（0~1023）。多实例部署时每个实例必须配置不同的值，否则单号会重复
   worker-id: 0
 
-  # ---------------- 阶段 4：RocketMQ 异步落库 ----------------
+  # ---------------- RocketMQ 异步落库 ----------------
   mq:
     # 置为 false 时退化为「Redis 预扣 + 同步落库」，可在本机未启动 Broker 时调试其它功能
     enabled: true
@@ -55,7 +55,7 @@ seckill:
     consume-thread-min: 4
     consume-thread-max: 8
 
-  # ---------------- 阶段 4 评审修复：后台维护任务 ----------------
+  # ---------------- 后台维护任务 ----------------
   # 待补偿任务重试 + 库存对账。
   maintenance:
     enabled: true
@@ -69,11 +69,11 @@ seckill:
       auto-repair: false          # 默认只告警不改数据
       stock-ids: 1                # 纳入自动对账的活动 ID（逗号分隔），留空则只支持手动对账
 
-  # ---------------- 阶段 5：本地消息表（Outbox） ----------------
+  # ---------------- 本地消息表（Outbox） ----------------
   # 请求线程在 Redis 预扣后先写 seckill_outbox 再返回，后台投递器再把它投进 MQ。
   # 收益：Broker 不可用不再等于用户丢单；「已受理但未投出」的规模变成可查询的数据库状态。
   outbox:
-    enabled: true                 # false 时回退到阶段 4 的同步投递行为
+    enabled: true                 # false 时回退到同步投递 MQ 的行为
     dispatch-interval-ms: 1000    # 投递器轮询间隔，决定「落库 → 进 MQ」的额外延迟
     batch-size: 500               # 单轮投递上限；批量发送后它直接决定投递吞吐（约 batch-size / 秒）
     max-retry: 15                 # 投递重试上限，用尽则回补 Redis 预扣并标记 FAILED

@@ -6,10 +6,9 @@ import org.springframework.scheduling.annotation.EnableScheduling;
 /**
  * 开启定时调度，供后台任务使用。
  * <p>
- * 【为什么这里不再带 @ConditionalOnProperty】原先是跟着 {@code seckill.maintenance.enabled} 开关的，
- * 但阶段 5 起「Outbox 投递器」也依赖调度，而它和「维护任务」是两个独立的开关。
- * 把 {@code @EnableScheduling} 做成无条件开启、由各任务自己用 {@code @ConditionalOnProperty}
- * 决定是否注册 —— 否则关掉维护任务会连带把投递器一起关掉，
+ * 【为什么这里不带 @ConditionalOnProperty】「维护任务」和「Outbox 投递器」都依赖调度，
+ * 却是两个独立的开关。把 {@code @EnableScheduling} 做成无条件开启、由各任务自己用
+ * {@code @ConditionalOnProperty} 决定是否注册 —— 否则关掉维护任务会连带把投递器一起关掉，
  * 那会导致 outbox 记录永远躺在 PENDING：接口返回「已受理」，订单却再也不会落库。
  * <p>
  * 【为什么用 Spring 自带调度而不是 XXL-JOB 之类】当前是单机项目，

@@ -15,8 +15,8 @@ public class OutboxProperties {
     /**
      * 是否启用 Outbox 链路。
      * <p>
-     * 置为 false 时请求线程回到阶段 4 的行为（直接同步投递 MQ），
-     * 用于对比两代方案的差异，或在本机排查「是不是 Outbox 引起的问题」。
+     * 置为 false 时请求线程退回同步投递 MQ 的行为，
+     * 用于对比两种方案的差异，或在本机排查「是不是 Outbox 引起的问题」。
      * 注意：MQ 关闭（{@code seckill.mq.enabled=false}）时本开关无效——
      * 那条链路本来就退化为同步落库，不经过 Outbox。
      */

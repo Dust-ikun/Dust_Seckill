@@ -23,13 +23,13 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * 秒杀订单消费者：把「确认订单 + 扣库存」从请求线程搬到独立线程池。
  * <p>
- * 这是阶段 4 的核心——请求线程只做到「写入预订单与待投递凭据」为止，数据库热点行写入
+ * 请求线程只做到「写入预订单与待投递凭据」为止，数据库热点行写入
  * 由这里的消费线程异步完成，于是请求的 RT 不再被数据库拖住，数据库连接池也不会再被大促流量占满。
  * <p>
  * 消费端要处理四件事：
  * <ol>
- *   <li><b>幂等</b>：MQ 保证的是「至少一次」投递，重复消费一定会发生。迁移第二步之后，
- *       幂等键不再是「插入撞唯一索引」（订单已在请求线程落地），而是
+ *   <li><b>幂等</b>：MQ 保证的是「至少一次」投递，重复消费一定会发生。
+ *       幂等键不是「插入撞唯一索引」（订单已在请求线程落地），而是
  *       {@code UPDATE orders ... WHERE status='PENDING'} 的<b>影响行数</b>：
  *       1 行才有权扣一次库存，0 行说明已被确认或已取消。见 {@link ConfirmOutcome}。</li>
  *   <li><b>重试</b>：确认失败（数据库瞬时故障、DB 库存不足等）返回 RECONSUME_LATER 让 RocketMQ 重投。
@@ -187,7 +187,7 @@ public class SeckillOrderConsumer implements MessageListenerConcurrently {
         // 若把它留在 DLQ 被人工重放，就会在库存已归还的前提下重新确认订单，反而制造出超卖。
         // 所以此处确认掉消息，靠 ERROR 日志 + 待补偿任务留痕。
         // 生产环境更稳妥的做法是把这类消息转投到一个「仅供人工审阅、不可自动重放」的死信 Topic，
-        // 而不是直接塞进可一键重放的 DLQ——这一点留给后续阶段。
+        // 而不是直接塞进可一键重放的 DLQ。
         return ConsumeConcurrentlyStatus.CONSUME_SUCCESS;
     }
 
@@ -268,8 +268,9 @@ public class SeckillOrderConsumer implements MessageListenerConcurrently {
      * 已处理完的消息总数：确认成功 / 重复投递 / 订单缺失 / 重试耗尽后已 ACK。
      * <p>
      * 与生产者侧的已投递数相减即可估算「在途消息数」，供对账判断使用。
-     * 注意这是<b>单实例</b>的 JVM 计数，多实例部署时只是粗略提示
-     * （迁移第三步将改用 {@code COUNT(orders WHERE status='PENDING')} 这个数据库事实）。
+     * 注意这是<b>单实例</b>的 JVM 计数，多实例部署时只是粗略提示；
+     * 对账使用的「在途预扣数」已改用数据库事实
+     * {@code COUNT(orders WHERE status='PENDING')}，不依赖本计数。
      */
     public int getResolvedCount() {
         return consumedCount.get() + duplicateCount.get()

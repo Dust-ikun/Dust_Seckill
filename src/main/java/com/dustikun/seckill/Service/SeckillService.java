@@ -21,7 +21,7 @@ import org.springframework.stereotype.Service;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * 秒杀主链路（阶段 5：Redis 预扣 + 本地消息表 + MQ 异步落库）。
+ * 秒杀主链路（Redis 预扣 + 本地消息表 + MQ 异步落库）。
  *
  * <pre>
  * 请求线程（RT 里没有热点行写入：stock 的条件 UPDATE 已挪到消费线程）
@@ -38,18 +38,13 @@ import java.util.concurrent.atomic.AtomicInteger;
  *       失败重试，重试耗尽则取消订单 + 归还预扣
  * </pre>
  *
- * <p><b>迁移第二步之后为什么订单要先落库</b>：让「订单与消息记录同一事务」真正成立，
+ * <p><b>为什么订单要先落库</b>：让「订单与消息记录同一事务」真正成立，
  * 同时把 {@code UPDATE stock} 这条热点行锁从请求线程彻底摘掉。
  * 代价是 outbox 记的仍然是<b>意图</b>（订单是 PENDING，不是已成立的结果），
  * 因此它是一个「预订单状态机 + 可靠命令队列」，而不是经典 Outbox 的「已完成结果的通知」。
  * 由于业务结果在请求那一刻还不存在，「用同一个事务记录业务结果」本就没有记录对象可谈。
  *
- * 【与图片演进路径的对应关系】
- * 裸扣减（超卖）→ MySQL 条件 UPDATE（阶段 2）→ Redis + Lua 原子扣减（阶段 3）
- * → 同步落库成为瓶颈 → MQ 异步落库（阶段 4）
- * → <b>MQ 投出之前进程消失则少卖 → 本地消息表 / Outbox（阶段 5）</b>
- *
- * <p><b>阶段 5 相比阶段 4 的两点变化</b>：
+ * <p><b>相比「请求线程直接同步投递 MQ」的两点关键差异</b>：
  * <ol>
  *   <li>请求线程不再同步投递 MQ，改为写一条窄表的待投递记录。因此
  *       <b>Broker 抖动不再等于用户丢单</b>，也少了一次跨进程往返；</li>
@@ -123,9 +118,9 @@ public class SeckillService {
         } catch (DataAccessException e) {
             // Redis 故障降级：宁可回落到数据库条件扣减，也不能让活动整体不可用。
             //
-            // 【评审修复】这里不再简单写死 false。Redis 命令可能**已经执行成功**，只是响应在网络上
-            // 超时——写死 false 会让这次预扣在后续落库失败时永远得不到回补，变成无人认领的孤儿。
-            // 因此先尽力探测一次，探测不出来才退回保守假设。
+            // 【为什么不能直接按「未生效」处理】Redis 命令可能**已经执行成功**，只是响应在网络
+            // 上超时——直接按 false 处理会让这次预扣在后续落库失败时永远得不到回补，
+            // 变成无人认领的孤儿。因此先尽力探测一次，探测不出来才退回保守假设。
             boolean actuallyDeducted = probePreDeducted(stockId, userId);
             return persistSynchronously(userId, stockId, actuallyDeducted, e);
         }
@@ -146,7 +141,7 @@ public class SeckillService {
     }
 
     /**
-     * 正常链路（第二步起）：一个事务里写入「PENDING 预订单 + 待投递凭据」，然后立即返回。
+     * 正常链路：一个事务里写入「PENDING 预订单 + 待投递凭据」，然后立即返回。
      * <p>
      * 请求线程到此为止，此后投递与扣库存都不再依赖它存活。
      * 唯一的数据库写是这个双表事务：没有热点行 UPDATE、没有业务失败分支
@@ -169,17 +164,17 @@ public class SeckillService {
     }
 
     /**
-     * 阶段 4 对照链路（{@code seckill.outbox.enabled=false}）：关掉 outbox，
-     * 请求线程直接投 MQ，用同一份消费端代码验证两代方案的差异。
+     * 同步投递对照链路（{@code seckill.outbox.enabled=false}）：关掉 outbox，
+     * 请求线程直接投 MQ，用同一份消费端代码对比两种方案的差异。
      * <p>
      * 【为什么这里也要先建预订单】消费者的确认动作要求订单已存在（它只做状态流转）。
-     * 若沿用阶段 4 的「先投消息、订单由消费端创建」，取消这一步就无处落脚 ——
+     * 若沿用「先投消息、订单由消费端创建」的做法，取消这一步就无处落脚 ——
      * 投递失败时已扣的库存无人归还。所以这里先建 PENDING 订单、再投递，
      * 投递失败则取消订单 + 归还库存。
      * <p>
-     * 【这条链路自愿放弃的东西】没有持久化凭据，因此退回阶段 4 的窗口：
-     * 进程若在「订单已建、消息未投」之间消失，这笔预订单会永久停在 PENDING 被当作在途，
-     * 只能靠对账的 PENDING 计数发现。生产路径不应开启这个开关。
+     * 【这条链路自愿放弃的东西】没有持久化凭据：进程若在「订单已建、消息未投」之间消失，
+     * 这笔预订单会永久停在 PENDING 被当作在途，只能靠对账的 PENDING 计数发现。
+     * 生产路径不应开启这个开关。
      */
     private SeckillOrderResponse acceptWithoutOutbox(String orderNo, Long userId, Long stockId,
                                                      boolean preDeducted, SeckillMessageProducer producer) {
@@ -225,7 +220,7 @@ public class SeckillService {
      *   <li>{@code DUPLICATE} —— 刚生成的单号在库里已存在，属单号生成缺陷：必须告警，
      *       并且这次预扣对应的订单并没有落成，所以要完整回滚。</li>
      * </ul>
-     * 迁移第二步把这个判定从消费端前移到了请求线程：命中时当场回补、当场拒绝，
+     * 这个判定放在请求线程完成：命中时当场回补、当场拒绝，
      * 不再需要走完「预扣 → 投递 → 消费 → 落库失败 → 回补」一整圈。
      */
     private void rejectIfRepeated(PersistOutcome outcome, String orderNo, Long userId, Long stockId,
@@ -254,7 +249,7 @@ public class SeckillService {
     /**
      * 查询订单最终状态。
      * <p>
-     * 迁移第二步之后，判据升级为「<b>订单状态优先</b>」——「处理中」第一次有了数据库证据：
+     * 判据是「<b>订单状态优先</b>」——「处理中」有数据库证据：
      * <ol>
      *   <li>订单存在且 {@code CONFIRMED} → {@code SUCCESS}；
      *   <li>订单存在且 {@code CANCELLED} → {@code FAILED}（后台已放弃并归还预扣）；
@@ -386,7 +381,7 @@ public class SeckillService {
     /**
      * 补偿之后必须检查补偿是否成功。
      * <p>
-     * 原实现把 {@code compensate} 的异常吞掉，调用方只看到原始的 {@code persist} 异常，
+     * 若把 {@code compensate} 的异常吞掉，调用方只看到原始的 {@code persist} 异常，
      * 完全不知道「补偿也失败了」——而这才是真正需要人工介入的状态。这里把它显式化：
      * 补偿失败就抛一个独立错误码，让上游与告警能把它识别出来。
      */
@@ -424,7 +419,7 @@ public class SeckillService {
     }
 
     /**
-     * 只回补库存、保留用户标记（评审修复新增）。
+     * 只回补库存、保留用户标记。
      * <p>
      * 用于「用户其实已经买过」：库存要还回去，但标记必须留着，
      * 否则用户在 Redis 侧会被重新放行，陷入「放行 → DB 拦截 → 回补 → 再放行」的死循环。

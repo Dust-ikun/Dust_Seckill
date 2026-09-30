@@ -70,7 +70,7 @@ public class StockReconcileService {
      * 在途数按「数据库库存 − PENDING 预订单数」自动计算，不需要调用方声明。
      *
      * @param stockId 活动 ID
-     * @param repair  是否真的修改数据。false 时只检测并给出建议
+     * @param repair  是否真的修改数据。false 时只检测不动数据（actions 恒为空，不产生修复建议）
      * @return 对账报告，其中的数值字段是<b>修复前</b>的快照
      */
     public ReconcileReport reconcile(Long stockId, boolean repair) {
@@ -86,7 +86,7 @@ public class StockReconcileService {
      * @param stockId          活动 ID
      * @param expectedInFlight 调用方声明的在途预扣数（已投递未落库的消息数），负值按 0 处理；
      *                         传 {@link #AUTO_IN_FLIGHT}（-1）表示由数据库自动计算
-     * @param repair           是否真的修改数据。false 时只检测并给出建议
+     * @param repair           是否真的修改数据。false 时只检测不动数据（actions 恒为空，不产生修复建议）
      * @return 对账报告，其中的数值字段是<b>修复前</b>的快照
      */
     public ReconcileReport reconcile(Long stockId, long expectedInFlight, boolean repair) {

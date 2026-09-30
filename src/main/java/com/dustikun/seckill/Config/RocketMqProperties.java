@@ -15,8 +15,8 @@ public class RocketMqProperties {
     /**
      * 是否启用 MQ 异步落库。
      * <p>
-     * 置为 false 时不会创建任何 RocketMQ 客户端，秒杀链路自动退化为「Redis 预扣 + 同步落库」，
-     * 等价于阶段 3 的行为。用于本机没起 Broker 时仍能启动应用调试其它功能。
+     * 置为 false 时不会创建任何 RocketMQ 客户端，秒杀链路自动退化为「Redis 预扣 + 同步落库」。
+     * 用于本机没起 Broker 时仍能启动应用调试其它功能。
      */
     private boolean enabled = true;
 

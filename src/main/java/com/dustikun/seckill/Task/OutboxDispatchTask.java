@@ -8,7 +8,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 /**
- * Outbox 投递器（阶段 5）。
+ * Outbox 投递器。
  * <p>
  * 【为什么用轮询而不是「写完立刻异步投」】写完立刻投需要额外一个内存队列把任务转交给后台线程，
  * 而那个队列一旦丢任务，outbox 记录就会一直躺在 PENDING 无人问津——

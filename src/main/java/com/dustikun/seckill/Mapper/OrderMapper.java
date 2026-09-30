@@ -26,7 +26,7 @@ public interface OrderMapper {
     /**
      * 按业务单号查询订单。
      * <p>
-     * 阶段 4 新增：异步落库之后，下单接口只能返回「已受理」，
+     * 异步落库之后，下单接口只能返回「已受理」，
      * 用户需要凭单号回查这笔单子到底落库了没有，因此需要按单号查询。
      * 走的是 {@code uk_order_no} 唯一索引，等值查询，代价很低。
      */
@@ -56,7 +56,7 @@ public interface OrderMapper {
     List<Long> selectUserIdsByStockId(@Param("stockId") Long stockId);
 
     /**
-     * 把订单从 PENDING 置为 CONFIRMED（条件更新）。迁移第二步起由消费线程调用。
+     * 把订单从 PENDING 置为 CONFIRMED（条件更新）。由消费线程调用。
      * <p>
      * 它承担「扣库存的许可证」职责：影响行数 1 = 本条消息拿到许可证、
      * 有权执行一次 DB 扣减；0 = 订单已被确认或取消（重投），<b>无权再扣</b>。
@@ -70,11 +70,13 @@ public interface OrderMapper {
     int confirmOrder(@Param("orderNo") String orderNo);
 
     /**
-     * 把订单从 PENDING 置为 CANCELLED（条件更新）。<b>迁移第一步新增，暂未接线。</b>
+     * 把订单从 PENDING 置为 CANCELLED（条件更新）。
      * <p>
-     * 仅「DB 库存不足」（Redis 与 DB 不一致）这类极罕见路径使用。取消后按
-     * 「补库存、留标记」处置 —— 与 {@code USER_ALREADY_BOUGHT} 同一取向（宁可少卖，绝不超卖）：
-     * 摘标记可能让用户被再放行又取消，形成循环。
+     * 由两条取消路径调用：消费端重试耗尽（{@code SeckillOrderConsumer}）、
+     * 关闭 outbox 的对照链路投递失败（{@code SeckillService}）、以及待补偿任务重试
+     * （{@code CompensateTaskService}，归还库存前必须先确认订单不成立）。
+     * 取消后按「补库存、留标记」处置 —— 与 {@code USER_ALREADY_BOUGHT} 同一取向
+     * （宁可少卖，绝不超卖）：摘标记可能让用户被再放行又取消，形成循环。
      */
     @Update("UPDATE orders SET status = 'CANCELLED' WHERE order_no = #{orderNo} AND status = 'PENDING'")
     int cancelOrder(@Param("orderNo") String orderNo);
@@ -82,9 +84,9 @@ public interface OrderMapper {
     /**
      * 某活动处于 PENDING（在途）的订单数。
      * <p>
-     * 第三步起它将替代 {@code producer.sentCount <= consumer.resolvedCount} 这组
-     * 单实例 JVM 计数器，作为 {@code pipelineDrained()} 的判定依据 ——
-     * 数据库事实天然多实例准确，这正是 {@code auto-repair} 一直被迫保持 false 的根因。
+     * 对账（AUTO 模式）用它当「在途预扣数」：期望 Redis 库存 = 数据库库存 − 本值。
+     * 注意对账快照走 {@link #selectReconcileSnapshot}（三个数同一条 SQL 取同一时刻），
+     * 本方法用于单独查询与测试。
      * 走 {@code idx_orders_stock_status} 索引。
      */
     @Select("SELECT COUNT(*) FROM orders WHERE stock_id = #{stockId} AND status = 'PENDING'")

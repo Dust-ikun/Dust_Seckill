@@ -6,7 +6,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 /**
- * Redis 预扣的「完整回滚」补偿动作（阶段 5 抽取）。
+ * Redis 预扣的「完整回滚」补偿动作。
  * <p>
  * 【为什么要抽出来】这个动作现在有两个调用方：请求线程（写待投递记录失败、降级同步落库失败）
  * 与后台投递器（消息重试耗尽）。两处若各写一遍，最容易出现的偏差是

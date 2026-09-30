@@ -19,7 +19,7 @@ import java.util.Set;
 /**
  * 库存缓存层：负责 Redis 侧库存的预热、原子扣减、回补与查询。
  * <p>
- * 阶段 3 的核心变化——把「校验 + 扣减」从数据库搬到 Redis，用一段 Lua 脚本在 Redis 单线程内
+ * 该层把「校验 + 扣减」从数据库搬到 Redis，用一段 Lua 脚本在 Redis 单线程内
  * 原子完成，把原本打在数据库行锁上的热点流量转化成了内存操作。
  * <p>
  * 该层只负责 Redis 侧，不碰事务；数据库落库由 {@link SeckillPersistenceService} 负责。
@@ -96,14 +96,14 @@ public class StockCacheService {
     /**
      * 原子预扣减。
      * <p>
-     * 【契约（评审修复后已收敛为无歧义）】
+     * 【契约】
      * <ul>
      *   <li>成功 —— 正常返回，不返回值；</li>
      *   <li>业务拒绝（库存不足 / 重复下单 / 未预热 / 参数错误）—— 抛 {@link BizException}；</li>
      *   <li>Redis 故障 —— 抛 {@code DataAccessException}，由调用方决定是否降级。</li>
      * </ul>
-     * 原先的 {@code boolean} 返回值只可能是 {@code true}（失败一律走异常），
-     * 却会让调用方误以为「返回 false 表示可继续往下走」。去掉它比保留一个永远为真的布尔值更不容易出错。
+     * 失败一律走异常而不返回布尔值：返回值只可能是「成功」一种含义，
+     * 留一个永远为真的布尔值反而会让调用方误以为「返回 false 表示可继续往下走」。
      */
     public void tryDeduct(Long stockId, Long userId, long num) {
         Long result = redisTemplate.execute(
@@ -227,7 +227,7 @@ public class StockCacheService {
         return value == null ? null : Integer.valueOf(value);
     }
 
-    // ==================== 以下为对账（阶段 4 评审修复）所需的读写能力 ====================
+    // ==================== 以下为对账所需的读写能力 ====================
 
     /** 已购用户集合的规模（对账用，SCARD 是 O(1)） */
     public long boughtCount(Long stockId) {

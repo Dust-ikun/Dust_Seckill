@@ -3,7 +3,7 @@ package com.dustikun.seckill.Common.result;
 import java.util.List;
 
 /**
- * 库存对账报告（阶段 4 评审修复新增）。
+ * 库存对账报告。
  * <p>
  * 【为什么必须有对账】Redis 预扣 + 数据库落库这条链路上，有两个补偿逻辑**结构上照不到**的角落：
  * <ol>
@@ -26,7 +26,7 @@ import java.util.List;
  * @param redisBoughtCount   Redis 已购集合规模
  * @param dbOrderCount       数据库订单数
  * @param repaired           本次调用是否真的修改了数据
- * @param actions            实际执行（或建议执行）的动作明细
+ * @param actions            实际执行过的修复动作明细；{@code repair=false} 时不做修复，恒为空列表
  * @param conclusion         面向人的一句话结论
  */
 public record ReconcileReport(

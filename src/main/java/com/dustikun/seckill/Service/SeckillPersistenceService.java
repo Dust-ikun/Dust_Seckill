@@ -15,7 +15,7 @@ import java.time.LocalDateTime;
 /**
  * 秒杀落库服务。
  * <p>
- * 【迁移第二步之后的形态：订单前置 + 后台确认】
+ * 【形态：订单前置 + 后台确认】
  * <pre>
  * 请求线程   createPending()   INSERT orders(status=PENDING) + INSERT outbox   同事务
  * 消费线程   confirm()         UPDATE orders SET status=CONFIRMED（许可证）+ UPDATE stock  同事务
@@ -29,9 +29,9 @@ import java.time.LocalDateTime;
  *   <li>独立 Bean 也规避了同类内部方法调用导致 {@code @Transactional} 失效的经典坑。</li>
  * </ul>
  *
- * <p><b>幂等键为什么要换代</b>：第一步之前扣库存的幂等键是「插入订单撞唯一索引」——
- * 插入撞了就不扣，天然成立。订单一旦在请求线程就落库（第二步），消费者只做 UPDATE，
- * 这个天然的把关点就消失了。于是改为<b>用订单状态流转的影响行数当许可证</b>：
+ * <p><b>扣库存的幂等键</b>：消费者只做 UPDATE，没有「插入订单撞唯一索引」这个天然把关点
+ * （插入撞了就不扣，天然成立；订单一旦在请求线程就落库，把关点就消失了）。
+ * 因此改为<b>用订单状态流转的影响行数当许可证</b>：
  * {@code UPDATE ... WHERE status='PENDING'} 影响 1 行才有权扣一次库存。见 {@link #confirm}。
  *
  * <p><b>为什么不再需要 {@code uk_user_stock} 兜底</b>：请求线程建预订单时，
@@ -45,7 +45,7 @@ public class SeckillPersistenceService {
     /**
      * 建单（{@link #createPending} / {@link #persist}）的结果。
      * <p>
-     * 三个取值对应三种<b>必须分开处理</b>的结局（评审修复重点）：
+     * 三个取值对应三种<b>必须分开处理</b>的结局：
      * <ul>
      *   <li>{@link #CREATED} —— 正常写入；</li>
      *   <li>{@link #DUPLICATE} —— 本单号已存在：单号生成器出了故障（同一条消息被重复投递时也会命中），
@@ -53,8 +53,8 @@ public class SeckillPersistenceService {
      *   <li>{@link #USER_ALREADY_BOUGHT} —— 撞 {@code uk_user_stock}：库里是「另一笔旧订单」，
      *       本次 Redis 预扣是多余的，<b>应当回补库存但保留用户标记</b>。</li>
      * </ul>
-     * 修复前这两个来源被合并成了同一个 {@code DUPLICATE}，调用方无法区分，
-     * 于是两种场景必然有一种被处理错：要么白白丢掉库存（少卖），要么把库存加多（超卖）。
+     * 这两个来源绝不能合并成同一个取值：调用方无法区分的话，
+     * 两种场景必然有一种被处理错——要么白白丢掉库存（少卖），要么把库存加多（超卖）。
      */
     public enum PersistOutcome {
         /** 本次调用真的把订单写进了数据库 */
@@ -139,11 +139,11 @@ public class SeckillPersistenceService {
     /**
      * 只建预订单、不写待投递记录。
      * <p>
-     * 仅供「显式关闭 outbox」（{@code seckill.outbox.enabled=false}）的阶段 4 对照路径使用：
+     * 仅供「显式关闭 outbox」（{@code seckill.outbox.enabled=false}）的同步投递对照路径使用：
      * 那条链路在请求线程直接投 MQ，因此没有需要持久化的「待投递凭据」。
      * <p>
-     * 代价必须说清：关掉 outbox 就自愿退回了阶段 4 的窗口，
-     * 并且多出一条阶段 4 没有的失败形态 —— 订单已落成 PENDING、消息却没投出去时，
+     * 代价必须说清：关掉 outbox 就自愿接受了「消息无持久化凭据」的窗口，
+     * 并且多出一条失败形态 —— 订单已落成 PENDING、消息却没投出去时，
      * 它会一直被认为「在途」，直到对账把它报出来。
      */
     @Transactional(rollbackFor = Exception.class)

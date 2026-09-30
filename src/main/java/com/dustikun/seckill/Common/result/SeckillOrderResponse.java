@@ -3,10 +3,10 @@ package com.dustikun.seckill.Common.result;
 /**
  * 秒杀下单的受理结果。
  * <p>
- * 阶段 4 起，下单与落库被拆开：请求线程只负责「Redis 预扣 + 投递消息」，落库交给消费者异步完成。
- * 因此接口的返回语义从「下单成功」变成「已受理」，客户端拿到 {@code orderNo} 后需要轮询
- * {@link #status} 才能知道最终结果——这正是把数据库从请求路径上摘掉的代价，也是这一阶段接口
- * 契约必须显式变化的原因。
+ * 下单与落库是拆开的：请求线程只负责「Redis 预扣 + 建预订单/登记待投递凭据」，
+ * 落库由消费线程异步完成。因此接口的返回语义是「已受理」而非「下单成功」，
+ * 客户端拿到 {@code orderNo} 后需要轮询 {@link #status} 才能知道最终结果——
+ * 这是把数据库热点写从请求路径上摘掉的代价。
  *
  * @param orderNo 业务单号，客户端据此轮询最终结果
  * @param status  受理状态
@@ -15,7 +15,7 @@ package com.dustikun.seckill.Common.result;
 public record SeckillOrderResponse(String orderNo, Status status, String message) {
 
     public enum Status {
-        /** 已受理：Redis 预扣成功且消息已投递，等待消费端异步落库 */
+        /** 已受理：预订单与待投递凭据已落库，等待后台投递与消费端异步落库 */
         QUEUED,
         /** 已成功：订单已落库（异步消费完成，或走降级同步落库时直接返回） */
         SUCCESS,
