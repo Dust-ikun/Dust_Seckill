@@ -3,11 +3,13 @@ package com.dustikun.seckill;
 import com.dustikun.seckill.Config.OutboxProperties;
 import com.dustikun.seckill.Config.RocketMqProperties;
 import com.dustikun.seckill.Mapper.OutboxMessageMapper;
+import com.dustikun.seckill.Metrics.SeckillMetrics;
 import com.dustikun.seckill.Mq.SeckillMessageProducer;
 import com.dustikun.seckill.Service.OutboxService;
 import com.dustikun.seckill.Service.PreDeductCompensator;
 import com.dustikun.seckill.Service.StockCacheService;
 import com.dustikun.seckill.entity.OutboxMessage;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.rocketmq.client.producer.DefaultMQProducer;
 import org.junit.jupiter.api.*;
@@ -258,14 +260,24 @@ class SeckillOutboxTest {
         mqProperties.setTag("unused-tag");
         DefaultMQProducer neverStarted = new DefaultMQProducer("outbox-test-never-started");
         SeckillMessageProducer broken =
-                new SeckillMessageProducer(neverStarted, new ObjectMapper(), mqProperties);
+                new SeckillMessageProducer(neverStarted, new ObjectMapper(), mqProperties, newMetrics());
 
         OutboxProperties properties = new OutboxProperties();
         properties.setMaxRetry(maxRetry);
         properties.setFirstRetryDelaySeconds(1);
         properties.setBatchSize(50);
 
-        return new OutboxService(outboxMapper, fixedProvider(broken), compensator, properties);
+        return new OutboxService(outboxMapper, fixedProvider(broken), compensator, properties, newMetrics());
+    }
+
+    /**
+     * 每次构造一个挂在<b>独立</b> SimpleMeterRegistry 上的指标出口。
+     * <p>
+     * 不复用同一个实例是有意的：同一个 registry 上重复注册同名 meter 会返回同一个 Counter，
+     * 于是多个用例的计数会累到一起。这里每个被测对象配一份干净的注册表，互不干扰。
+     */
+    private SeckillMetrics newMetrics() {
+        return new SeckillMetrics(new SimpleMeterRegistry());
     }
 
     /**

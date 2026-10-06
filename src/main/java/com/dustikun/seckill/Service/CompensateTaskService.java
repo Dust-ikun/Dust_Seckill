@@ -2,8 +2,11 @@ package com.dustikun.seckill.Service;
 
 import com.dustikun.seckill.Common.constant.CompensateType;
 import com.dustikun.seckill.Common.result.RollbackResult;
+import com.dustikun.seckill.Common.util.BackoffPolicy;
+import com.dustikun.seckill.Common.util.Strings;
 import com.dustikun.seckill.Mapper.CompensateTaskMapper;
 import com.dustikun.seckill.Mapper.OrderMapper;
+import com.dustikun.seckill.Metrics.SeckillMetrics;
 import com.dustikun.seckill.entity.CompensateTask;
 import com.dustikun.seckill.entity.Order;
 import lombok.extern.slf4j.Slf4j;
@@ -13,7 +16,6 @@ import org.springframework.stereotype.Service;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * 待补偿任务的登记与重试。
@@ -48,9 +50,13 @@ public class CompensateTaskService {
     /** 最大重试次数。超过则标记 FAILED，等人工介入，而不是无限重试 */
     private final int maxRetry;
 
-    private final AtomicInteger enqueuedCount = new AtomicInteger();
-    private final AtomicInteger recoveredCount = new AtomicInteger();
-    private final AtomicInteger abandonedCount = new AtomicInteger();
+    /**
+     * 指标出口。计数不再由本类自己维护。
+     * <p>
+     * 补偿侧的计数尤其需要时间维度：{@code abandoned} 一旦增长就意味着有库存需要人工核账，
+     * 告警规则应当是「最近 5 分钟新增 &gt; 0 就报警」——这是 JVM 累计值做不到的。
+     */
+    private final SeckillMetrics metrics;
 
     public CompensateTaskService(CompensateTaskMapper compensateTaskMapper,
                                  StockCacheService stockCacheService,
@@ -58,12 +64,14 @@ public class CompensateTaskService {
                                  @Value("${seckill.maintenance.compensate.first-retry-delay-seconds:10}")
                                  long firstRetryDelaySeconds,
                                  @Value("${seckill.maintenance.compensate.max-retry:10}")
-                                 int maxRetry) {
+                                 int maxRetry,
+                                 SeckillMetrics metrics) {
         this.compensateTaskMapper = compensateTaskMapper;
         this.stockCacheService = stockCacheService;
         this.orderMapper = orderMapper;
         this.firstRetryDelaySeconds = firstRetryDelaySeconds;
         this.maxRetry = maxRetry;
+        this.metrics = metrics;
     }
 
     /**
@@ -81,11 +89,11 @@ public class CompensateTaskService {
             task.setOrderNo(orderNo);
             task.setNum((int) num);
             task.setType(type.name());
-            task.setReason(truncate(reason, REASON_MAX));
+            task.setReason(Strings.truncate(reason, REASON_MAX));
             task.setNextRetryTime(LocalDateTime.now().plusSeconds(firstRetryDelaySeconds));
             compensateTaskMapper.insert(task);
 
-            enqueuedCount.incrementAndGet();
+            metrics.onCompensateEnqueued();
             log.warn("[待补偿·登记] id={}, type={}, stockId={}, userId={}, orderNo={}, reason={}",
                     task.getId(), type, stockId, userId, orderNo, reason);
         } catch (Exception e) {
@@ -119,7 +127,7 @@ public class CompensateTaskService {
             RollbackResult result = apply(task, type);
 
             if (result.rolledBack()) {
-                recoveredCount.incrementAndGet();
+                metrics.onCompensateRecovered();
                 compensateTaskMapper.markDone(task.getId());
                 log.warn("[待补偿·完成] id={}, type={}, 剩余库存={}, orderNo={}",
                         task.getId(), type, result.remainStock(), task.getOrderNo());
@@ -210,8 +218,8 @@ public class CompensateTaskService {
         int attempts = task.getRetryCount() == null ? 0 : task.getRetryCount();
 
         if (attempts + 1 >= maxRetry) {
-            abandonedCount.incrementAndGet();
-            compensateTaskMapper.markFailed(task.getId(), truncate(error, ERROR_MAX));
+            metrics.onCompensateAbandoned();
+            compensateTaskMapper.markFailed(task.getId(), Strings.truncate(error, ERROR_MAX));
             log.error("[待补偿·放弃 → 需人工介入] 已重试 {} 次仍失败。"
                             + "id={}, type={}, stockId={}, userId={}, orderNo={}, lastError={}",
                     attempts + 1, task.getId(), task.getType(),
@@ -220,37 +228,25 @@ public class CompensateTaskService {
         }
 
         compensateTaskMapper.reschedule(
-                task.getId(), LocalDateTime.now().plus(backoff(attempts)), truncate(error, ERROR_MAX));
+                task.getId(), LocalDateTime.now().plus(backoff(attempts)),
+                Strings.truncate(error, ERROR_MAX));
     }
 
     /**
      * 指数退避：first, 2×first, 4×first …… 但不超过 5 分钟。
      * <p>
+     * 算法本身在 {@link BackoffPolicy} 里 —— 与 Outbox 投递链路共用同一份实现，
+     * 只是首次延迟来自不同的配置项（{@code seckill.maintenance.compensate.first-retry-delay-seconds}）。
      * 上限的作用是让「Redis 宕机 30 分钟」这类故障不必退避到几小时之后才被重试一次。
      */
     private Duration backoff(int attempts) {
-        long seconds = firstRetryDelaySeconds << Math.min(attempts, 6);
-        return Duration.ofSeconds(Math.min(seconds, Duration.ofMinutes(5).toSeconds()));
+        return BackoffPolicy.exponential(firstRetryDelaySeconds, attempts);
     }
 
-    private String truncate(String text, int max) {
-        if (text == null) {
-            return null;
-        }
-        return text.length() <= max ? text : text.substring(0, max);
-    }
-
-    public int getEnqueuedCount() {
-        return enqueuedCount.get();
-    }
-
-    public int getRecoveredCount() {
-        return recoveredCount.get();
-    }
-
-    public int getAbandonedCount() {
-        return abandonedCount.get();
-    }
+    // 本类原先在这里暴露 getEnqueuedCount() / getRecoveredCount() / getAbandonedCount()
+    // 读 JVM 计数器，现已删除：读数请走 SeckillMetrics。
+    //
+    // 另：私有的 truncate(text, max) 已抽到 Common.util.Strings（与 OutboxService 共用）。
 
     /** 当前仍待处理的条数（从库里查，跨实例可见） */
     public int countPending() {

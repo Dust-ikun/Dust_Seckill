@@ -1,7 +1,10 @@
 package com.dustikun.seckill.Service;
 
+import com.dustikun.seckill.Common.util.BackoffPolicy;
+import com.dustikun.seckill.Common.util.Strings;
 import com.dustikun.seckill.Config.OutboxProperties;
 import com.dustikun.seckill.Mapper.OutboxMessageMapper;
+import com.dustikun.seckill.Metrics.SeckillMetrics;
 import com.dustikun.seckill.Mq.SeckillMessage;
 import com.dustikun.seckill.Mq.SeckillMessageProducer;
 import com.dustikun.seckill.entity.OutboxMessage;
@@ -13,7 +16,6 @@ import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * 本地消息表（Outbox）：把「这笔预扣需要投递一条消息」在返回用户之前持久化下来。
@@ -57,20 +59,23 @@ public class OutboxService {
     private final PreDeductCompensator compensator;
     private final OutboxProperties properties;
 
-    private final AtomicInteger enqueuedCount = new AtomicInteger();
-    private final AtomicInteger sentCount = new AtomicInteger();
-    private final AtomicInteger retriedCount = new AtomicInteger();
-    private final AtomicInteger abandonedCount = new AtomicInteger();
-    private final AtomicInteger purgedCount = new AtomicInteger();
+    /**
+     * 指标出口。计数不再由本类自己维护 —— 本类原先持有 5 个 {@code AtomicInteger}。
+     * 多实例部署时它们各看各的，而 outbox 的欠账规模本来就是跨实例的事实，
+     * 用 JVM 计数器描述它天生错位（真正准确的口径是 Gauge {@code seckill.outbox.pending}）。
+     */
+    private final SeckillMetrics metrics;
 
     public OutboxService(OutboxMessageMapper outboxMapper,
                          ObjectProvider<SeckillMessageProducer> producerProvider,
                          PreDeductCompensator compensator,
-                         OutboxProperties properties) {
+                         OutboxProperties properties,
+                         SeckillMetrics metrics) {
         this.outboxMapper = outboxMapper;
         this.producerProvider = producerProvider;
         this.compensator = compensator;
         this.properties = properties;
+        this.metrics = metrics;
     }
 
     // ==================================================================== 写入
@@ -97,7 +102,7 @@ public class OutboxService {
         message.setNextRetryTime(LocalDateTime.now().minusSeconds(1));
 
         outboxMapper.insert(message);
-        enqueuedCount.incrementAndGet();
+        metrics.onOutboxEnqueued();
         log.debug("[Outbox·登记] id={}, orderNo={}, stockId={}, userId={}",
                 message.getId(), orderNo, stockId, userId);
     }
@@ -139,7 +144,7 @@ public class OutboxService {
             }
             producer.sendOrderCreatedBatch(messages);
             outboxMapper.markSentBatch(ids);
-            sentCount.addAndGet(ids.size());
+            metrics.onOutboxSent(ids.size());
             log.debug("[Outbox·批量投出] {} 条", ids.size());
             return ids.size();
         } catch (Exception e) {
@@ -169,7 +174,7 @@ public class OutboxService {
             producer.sendOrderCreated(SeckillMessage.of(
                     message.getOrderNo(), message.getUserId(), message.getStockId(), message.getNum()));
             outboxMapper.markSent(message.getId());
-            sentCount.incrementAndGet();
+            metrics.onOutboxSent(1);
             log.debug("[Outbox·已投出] orderNo={}", message.getOrderNo());
             return true;
         } catch (Exception e) {
@@ -179,7 +184,7 @@ public class OutboxService {
     }
 
     private void handleFailure(OutboxMessage message, Exception e) {
-        String error = truncate(e.getClass().getSimpleName() + ": " + e.getMessage(), ERROR_MAX);
+        String error = Strings.truncate(e.getClass().getSimpleName() + ": " + e.getMessage(), ERROR_MAX);
         int attempts = message.getRetryCount() == null ? 0 : message.getRetryCount();
 
         if (attempts + 1 >= properties.getMaxRetry()) {
@@ -189,7 +194,7 @@ public class OutboxService {
             // 按现在的顺序，最坏情况是预扣泄漏（少卖），而对账能发现它；两者代价不对称，
             // 因此顺序选择应当明确偏向「宁可少卖，绝不超卖」。
             outboxMapper.markFailed(message.getId(), error);
-            abandonedCount.incrementAndGet();
+            metrics.onOutboxAbandoned();
             log.error("[Outbox·放弃 → 需人工介入] 重试 {} 次仍无法投递，已回补 Redis 预扣。"
                             + "orderNo={}, stockId={}, userId={}, lastError={}",
                     attempts + 1, message.getOrderNo(), message.getStockId(), message.getUserId(), error);
@@ -205,7 +210,7 @@ public class OutboxService {
 
         LocalDateTime next = LocalDateTime.now().plus(backoff(attempts));
         outboxMapper.reschedule(message.getId(), next, error);
-        retriedCount.incrementAndGet();
+        metrics.onOutboxRetried();
         log.warn("[Outbox·退避重试] 第 {} 次投递失败，将于 {} 重试。orderNo={}, error={}",
                 attempts + 1, next, message.getOrderNo(), error);
     }
@@ -213,11 +218,12 @@ public class OutboxService {
     /**
      * 指数退避：first, 2×first, 4×first …… 但不超过 5 分钟。
      * <p>
-     * 上限让「Broker 宕机半小时」这类故障不至于退避到几小时之后才重试一次。
+     * 算法本身在 {@link BackoffPolicy} 里（与待补偿任务链路共用同一份），
+     * 这里只负责把配置项喂进去。两条链路共用一份实现是刻意的：
+     * 退避曲线决定「故障多久后重试」，不该存在两个可能悄悄跑偏的真相。
      */
     private Duration backoff(int attempts) {
-        long seconds = (long) properties.getFirstRetryDelaySeconds() << Math.min(attempts, 6);
-        return Duration.ofSeconds(Math.min(seconds, Duration.ofMinutes(5).toSeconds()));
+        return BackoffPolicy.exponential(properties.getFirstRetryDelaySeconds(), attempts);
     }
 
     // ==================================================================== 查询
@@ -255,38 +261,15 @@ public class OutboxService {
         LocalDateTime before = LocalDateTime.now().minusHours(properties.getRetentionHours());
         int removed = outboxMapper.purgeSentBefore(before, properties.getPurgeBatchSize());
         if (removed > 0) {
-            purgedCount.addAndGet(removed);
+            metrics.onOutboxPurged(removed);
             log.info("[Outbox·归档] 已清理 {} 条早于 {} 的已投递记录", removed, before);
         }
         return removed;
     }
 
-    private String truncate(String text, int max) {
-        if (text == null) {
-            return null;
-        }
-        return text.length() <= max ? text : text.substring(0, max);
-    }
-
-    // ==================================================================== 计数
-
-    public int getEnqueuedCount() {
-        return enqueuedCount.get();
-    }
-
-    public int getSentCount() {
-        return sentCount.get();
-    }
-
-    public int getRetriedCount() {
-        return retriedCount.get();
-    }
-
-    public int getAbandonedCount() {
-        return abandonedCount.get();
-    }
-
-    public int getPurgedCount() {
-        return purgedCount.get();
-    }
+    // 本类原先在这里暴露 5 个 getXxxCount() 读 JVM 计数器，现已删除：
+    // 读数请走 SeckillMetrics，两个出口读的是同一份。
+    //
+    // 另：私有的 truncate(text, max) 已抽到 Common.util.Strings —— 它与
+    // CompensateTaskService 里的那份逐字相同，属于同一条「截断到列宽」的约定。
 }

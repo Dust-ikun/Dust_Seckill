@@ -3,6 +3,7 @@ package com.dustikun.seckill.Mq;
 import com.dustikun.seckill.Common.Exception.BizException;
 import com.dustikun.seckill.Common.Exception.ErrorCode;
 import com.dustikun.seckill.Config.RocketMqProperties;
+import com.dustikun.seckill.Metrics.SeckillMetrics;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.rocketmq.client.producer.DefaultMQProducer;
 import org.apache.rocketmq.client.producer.SendResult;
@@ -14,7 +15,6 @@ import tools.jackson.databind.ObjectMapper;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * 秒杀订单消息投递器。
@@ -46,15 +46,25 @@ public class SeckillMessageProducer {
     private final ObjectMapper objectMapper;
     private final RocketMqProperties properties;
 
-    private final AtomicInteger sentCount = new AtomicInteger(0);
-    private final AtomicInteger failedCount = new AtomicInteger(0);
+    /**
+     * 指标出口。计数不再由本类自己维护。
+     * <p>
+     * 【注意它与 {@code seckill.outbox.sent} 的口径重叠】两者都在描述「消息已进 Broker」：
+     * 本类统计的是<b>客户端发送动作</b>（含同步降级链路里请求线程的直接投递），
+     * Outbox 统计的是<b>待投递记录的结清</b>（只含投递器路径）。
+     * 保留两个是把现有 /seckill/metrics 的字段原样搬过来、不改变语义；
+     * 若后续要合并口径，应以 Outbox 侧为准（它才是「欠账是否还清」的那个账本）。
+     */
+    private final SeckillMetrics metrics;
 
     public SeckillMessageProducer(DefaultMQProducer producer,
                                   ObjectMapper objectMapper,
-                                  RocketMqProperties properties) {
+                                  RocketMqProperties properties,
+                                  SeckillMetrics metrics) {
         this.producer = producer;
         this.objectMapper = objectMapper;
         this.properties = properties;
+        this.metrics = metrics;
     }
 
     /**
@@ -64,8 +74,8 @@ public class SeckillMessageProducer {
     public void sendOrderCreated(SeckillMessage message) {
         try {
             SendResult result = producer.send(toMqMessage(message));
-            checkSendResult(result, message.orderNo());
-            sentCount.incrementAndGet();
+            checkSendResult(result, message.orderNo(), 1);
+            metrics.onMqSent(1);
             log.debug("[投递成功] orderNo={}, msgId={}, queue={}",
                     message.orderNo(), result.getMsgId(), result.getMessageQueue().getQueueId());
         } catch (BizException e) {
@@ -73,7 +83,7 @@ public class SeckillMessageProducer {
         } catch (Exception e) {
             // 序列化失败、RemotingException、MQBrokerException、超时等统一收敛为「投递失败」
             log.error("[投递异常] orderNo={}", message.orderNo(), e);
-            failedCount.incrementAndGet();
+            metrics.onMqSendFailed(1);
             throw new BizException(ErrorCode.MQ_SEND_FAILED);
         }
     }
@@ -102,7 +112,7 @@ public class SeckillMessageProducer {
             }
         } catch (Exception e) {
             log.error("[批量投递异常] 序列化阶段失败，本批 {} 条", messages.size(), e);
-            failedCount.addAndGet(messages.size());
+            metrics.onMqSendFailed(messages.size());
             throw new BizException(ErrorCode.MQ_SEND_FAILED);
         }
 
@@ -114,14 +124,15 @@ public class SeckillMessageProducer {
 
         try {
             SendResult result = producer.send(batch);
-            checkSendResult(result, messages.get(0).orderNo() + " 等 " + messages.size() + " 条");
-            sentCount.addAndGet(messages.size());
+            checkSendResult(result, messages.get(0).orderNo() + " 等 " + messages.size() + " 条",
+                    messages.size());
+            metrics.onMqSent(messages.size());
             log.debug("[批量投递成功] {} 条，msgId={}", messages.size(), result.getMsgId());
         } catch (BizException e) {
             throw e;
         } catch (Exception e) {
             log.error("[批量投递异常] 本批 {} 条全部未确认", messages.size(), e);
-            failedCount.addAndGet(messages.size());
+            metrics.onMqSendFailed(messages.size());
             throw new BizException(ErrorCode.MQ_SEND_FAILED);
         }
     }
@@ -135,20 +146,31 @@ public class SeckillMessageProducer {
                 objectMapper.writeValueAsBytes(message));
     }
 
-    private void checkSendResult(SendResult result, String orderNo) {
+    /**
+     * 校验发送结果。<b>只负责判断与计数，不负责构造异常</b>。
+     *
+     * <p><b>为什么必须传入失败条数</b>：这里的调用方有两个粒度 —— 单条投递失败 1 条、
+     * 批量投递整批失败 {@code messages.size()} 条。若把计数写死成 1（早先的写法），
+     * 批量路径整批 500 条失败也只会给 {@code seckill.mq.send.failed} 加 1，
+     * 于是这个 Counter 在批量路径下严重低估失败规模，而它正是「Broker 是不是在抖」的告警依据。
+     *
+     * <p><b>为什么异常在这里抛、而计数不在这里做</b>：计数必须恰好发生一次。
+     * 若本方法既计数又抛异常，调用方的 {@code catch (Exception)} 会再计一次 ——
+     * 这就是「重复计数」的来源。因此此处<b>只按传入粒度计一次</b>，
+     * 调用方的 {@code catch (BizException e) { throw e; }} 直接重抛、不再计数。
+     *
+     * @param failedCount 本次失败对应的消息条数。单条传 1，批量传整批大小
+     */
+    private void checkSendResult(SendResult result, String orderNo, int failedCount) {
         if (result == null || result.getSendStatus() != SendStatus.SEND_OK) {
             String status = result == null ? "null" : String.valueOf(result.getSendStatus());
-            log.error("[投递失败] Broker 未确认。orderNo={}, sendStatus={}", orderNo, status);
-            failedCount.incrementAndGet();
+            log.error("[投递失败] Broker 未确认。orderNo={}, sendStatus={}, 涉及 {} 条",
+                    orderNo, status, failedCount);
+            metrics.onMqSendFailed(failedCount);
             throw new BizException(ErrorCode.MQ_SEND_FAILED);
         }
     }
 
-    public int getSentCount() {
-        return sentCount.get();
-    }
-
-    public int getFailedCount() {
-        return failedCount.get();
-    }
+    // 本类原先在这里暴露 getSentCount() / getFailedCount() 读 JVM 计数器，现已删除：
+    // 读数请走 SeckillMetrics.mqSentCount() / mqSendFailedCount()。
 }
