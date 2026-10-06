@@ -12,6 +12,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Service;
 
+import java.time.Duration;
 import java.util.Collection;
 import java.util.List;
 import java.util.Set;
@@ -52,6 +53,20 @@ public class StockCacheService {
      * 取 24 小时留出充分余量，同时到期自动回收，不会让 key 永久堆积。
      */
     private static final long RESTORE_DEDUPE_TTL_SECONDS = 24 * 60 * 60L;
+
+    /**
+     * 已购用户集合（{@code seckill:bought:{stockId}}）的兜底 TTL。
+     * <p>
+     * 该集合是「一人一单」的判重依据，活动期间绝不能过期，因此取值不是"精确的活动时长"，
+     * 而是"显著长于活动全程 + 所有仍依赖该标记的滞后流程"：MQ 消费延迟重试（10s/30s/1m）
+     * 与待补偿任务重试（最长约 30 分钟）都会读取该标记。
+     * <p>
+     * 写入规则是「只设一次、绝不刷新」：三处写入点（扣减脚本 / 仅回补脚本 / 对账补标）
+     * 都以 TTL == -1 为守卫，仅在集合被创建后的第一次写入时锚定，到期时间固定 =
+     * 首次写入 + 24h，回收期限不随下单流量漂移。它只是 {@link #clear} 缺席时的内存回收兜底；
+     * 若未来引入活动结束时间，把传入值换成「剩余活动时长 + 余量」即可精确锚定活动期间，脚本无需改动。
+     */
+    private static final long BOUGHT_SET_TTL_SECONDS = 24 * 60 * 60L;
 
     private final StringRedisTemplate redisTemplate;
     private final RedisScript<Long> deductScript;
@@ -110,7 +125,8 @@ public class StockCacheService {
                 deductScript,
                 keys(stockId),
                 String.valueOf(userId),
-                String.valueOf(num));
+                String.valueOf(num),
+                String.valueOf(BOUGHT_SET_TTL_SECONDS));
 
         if (result == null) {
             throw new BizException(ErrorCode.SYSTEM_BUSY);
@@ -152,22 +168,7 @@ public class StockCacheService {
                 keys(stockId),
                 String.valueOf(userId),
                 String.valueOf(num));
-
-        if (result == null) {
-            // Redis 连接中断等：脚本可能执行了也可能没执行，必须如实告知「结果未知」
-            log.error("[回补] Redis 未返回结果，回补状态未知，需人工确认。stockId={}, userId={}", stockId, userId);
-            return RollbackResult.of(RollbackResult.Status.REDIS_ERROR);
-        }
-        if (result >= 0) {
-            return RollbackResult.success(result.intValue());
-        }
-
-        return RollbackResult.of(switch (result.intValue()) {
-            case ROLLBACK_ILLEGAL_NUM -> RollbackResult.Status.ILLEGAL_ARGUMENT;
-            case ROLLBACK_ACTIVITY_CLOSED -> RollbackResult.Status.ACTIVITY_CLOSED;
-            case ROLLBACK_ALREADY_DONE -> RollbackResult.Status.ALREADY_ROLLED_BACK;
-            default -> RollbackResult.Status.REDIS_ERROR;
-        });
+        return mapRollbackResult(result, "回补", "stockId=" + stockId + ", userId=" + userId);
     }
 
     /**
@@ -185,10 +186,35 @@ public class StockCacheService {
                 restoreKeys(stockId, token),
                 String.valueOf(userId),
                 String.valueOf(num),
-                String.valueOf(RESTORE_DEDUPE_TTL_SECONDS));
+                String.valueOf(RESTORE_DEDUPE_TTL_SECONDS),
+                String.valueOf(BOUGHT_SET_TTL_SECONDS));
+        return mapRollbackResult(result, "仅回补库存", "stockId=" + stockId + ", token=" + token);
+    }
 
+    /**
+     * 把 Lua 脚本的返回值映射成 {@link RollbackResult}。
+     *
+     * <p><b>为什么两个脚本共用这一段</b>
+     * <p>
+     * {@code seckill_rollback.lua} 与 {@code seckill_restore_stock.lua} 的<b>返回码协议是同源的</b>：
+     * 都约定 {@code >= 0} 为成功（值为剩余库存）、{@code -1/-2/-3} 分别为
+     * 入参非法 / 活动已结束 / 幂等命中。两条路径对每种结局的处置也完全一致
+     * （{@link RollbackResult#benign()} 决定要不要告警、{@link RollbackResult#rolledBack()}
+     * 决定要不要记补偿成功）。
+     * <p>
+     * 所以这段映射是「回补语义的唯一解释」，各写一份意味着：将来动协议时只改一处、
+     * 另一处继续按旧约定解读返回值——而这两条路径恰恰是「误把幂等命中当成失败去重试就会把库存补多」
+     * 的地方，静默分歧的代价是超卖。共用一个私有方法是刻意的。
+     *
+     * @param result 脚本原始返回值；{@code null} 表示 Redis 未返回（连接中断、命令超时）
+     * @param op     动作名，仅用于日志前缀区分两条路径
+     * @param ctx    日志上下文（已经拼好的 key-value 串），由调用方决定带哪些字段
+     */
+    private RollbackResult mapRollbackResult(Long result, String op, String ctx) {
         if (result == null) {
-            log.error("[仅回补库存] Redis 未返回结果，状态未知，需人工确认。stockId={}, token={}", stockId, token);
+            // Redis 连接中断等：脚本可能执行了也可能没执行，必须如实告知「结果未知」。
+            // 这一条绝不能退化成 benign —— 那会让一笔未知结局的回补被当成「无需处理」结案。
+            log.error("[{}] Redis 未返回结果，状态未知，需人工确认。{}", op, ctx);
             return RollbackResult.of(RollbackResult.Status.REDIS_ERROR);
         }
         if (result >= 0) {
@@ -199,6 +225,7 @@ public class StockCacheService {
             case ROLLBACK_ILLEGAL_NUM -> RollbackResult.Status.ILLEGAL_ARGUMENT;
             case ROLLBACK_ACTIVITY_CLOSED -> RollbackResult.Status.ACTIVITY_CLOSED;
             case ROLLBACK_ALREADY_DONE -> RollbackResult.Status.ALREADY_ROLLED_BACK;
+            // 未知负数一律按「结果未知」处理，绝不猜成某个已知结局
             default -> RollbackResult.Status.REDIS_ERROR;
         });
     }
@@ -268,7 +295,23 @@ public class StockCacheService {
         }
         Long added = redisTemplate.opsForSet()
                 .add(SeckillRedisKeys.boughtUsers(stockId), userIds.toArray(new String[0]));
+        if (added != null && added > 0) {
+            ensureBoughtTtl(stockId);
+        }
         return added == null ? 0L : added;
+    }
+
+    /**
+     * 对账补标路径的 TTL 兜底，与两个 Lua 脚本同一条规则：
+     * 集合存在但没有 TTL（TTL == -1）时补设一次，已有 TTL 则绝不动它。
+     * 集合可能整体缺失后由本方法重建，因此这里也要兜住「存在即带 TTL」的不变量。
+     */
+    private void ensureBoughtTtl(Long stockId) {
+        String key = SeckillRedisKeys.boughtUsers(stockId);
+        Long ttl = redisTemplate.getExpire(key);
+        if (ttl != null && ttl == -1) {
+            redisTemplate.expire(key, Duration.ofSeconds(BOUGHT_SET_TTL_SECONDS));
+        }
     }
 
     /**

@@ -19,7 +19,13 @@ public final class SeckillRedisKeys {
         return PREFIX + "stock:{" + stockId + "}";
     }
 
-    /** 已下单用户集合，Set 类型，用于「一人一单」去重 */
+    /**
+     * 已下单用户集合，Set 类型，用于「一人一单」去重。
+     * <p>
+     * TTL 策略：只设一次、绝不刷新（各写入点以 TTL == -1 为守卫），
+     * 到期 = 首次写入 + 兜底时长，仅作为 {@code clear()} 缺席时的内存回收兜底，
+     * 取值依据见 {@code StockCacheService#BOUGHT_SET_TTL_SECONDS}。
+     */
     public static String boughtUsers(Long stockId) {
         return PREFIX + "bought:{" + stockId + "}";
     }
