@@ -8,6 +8,7 @@ import com.dustikun.seckill.Common.result.SeckillOrderResponse;
 import com.dustikun.seckill.Common.util.OrderNoGenerator;
 import com.dustikun.seckill.Config.OutboxProperties;
 import com.dustikun.seckill.Mapper.OrderMapper;
+import com.dustikun.seckill.Metrics.SeckillMetrics;
 import com.dustikun.seckill.Mq.SeckillMessage;
 import com.dustikun.seckill.Mq.SeckillMessageProducer;
 import com.dustikun.seckill.Service.SeckillPersistenceService.PersistOutcome;
@@ -17,8 +18,6 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.dao.DataAccessException;
 import org.springframework.stereotype.Service;
-
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * 秒杀主链路（Redis 预扣 + 本地消息表 + MQ 异步落库）。
@@ -79,11 +78,14 @@ public class SeckillService {
      */
     private final ObjectProvider<SeckillMessageProducer> producerProvider;
 
-    private final AtomicInteger queuedCount = new AtomicInteger(0);
-    private final AtomicInteger successCount = new AtomicInteger(0);
-    private final AtomicInteger degradedCount = new AtomicInteger(0);
-    private final AtomicInteger rollbackCount = new AtomicInteger(0);
-    private final AtomicInteger restoreStockOnlyCount = new AtomicInteger(0);
+    /**
+     * 指标出口。
+     * <p>
+     * 本类原本自己持有 5 个 {@code AtomicInteger} 计数器，现已全部删除 ——
+     * 计数的所有权统一交给 {@link SeckillMetrics}（原因见该类注释：重启归零、多实例各看各的、
+     * 没有时间维度算不出 rate）。本类只负责「报告事件发生」，不再负责「保存数字」。
+     */
+    private final SeckillMetrics metrics;
 
     public SeckillService(StockCacheService stockCacheService,
                           SeckillPersistenceService persistenceService,
@@ -93,7 +95,8 @@ public class SeckillService {
                           OutboxProperties outboxProperties,
                           OrderNoGenerator orderNoGenerator,
                           OrderMapper orderMapper,
-                          ObjectProvider<SeckillMessageProducer> producerProvider) {
+                          ObjectProvider<SeckillMessageProducer> producerProvider,
+                          SeckillMetrics metrics) {
         this.stockCacheService = stockCacheService;
         this.persistenceService = persistenceService;
         this.compensateTaskService = compensateTaskService;
@@ -103,6 +106,7 @@ public class SeckillService {
         this.orderNoGenerator = orderNoGenerator;
         this.orderMapper = orderMapper;
         this.producerProvider = producerProvider;
+        this.metrics = metrics;
     }
 
     /**
@@ -159,7 +163,7 @@ public class SeckillService {
         }
         rejectIfRepeated(outcome, orderNo, userId, stockId, preDeducted, "建预订单撞 uk_user_stock");
 
-        queuedCount.incrementAndGet();
+        metrics.onQueued();
         return SeckillOrderResponse.queued(orderNo);
     }
 
@@ -192,24 +196,36 @@ public class SeckillService {
         } catch (Exception e) {
             // 投递没成功，但预订单已经落库：必须先把它取消掉，否则它会一直被认为「在途」，
             // 而库存归还之后这个状态就再也没人来纠正了（没有凭据可以重投）。
-            //
-            // 【取消本身失败时也必须继续归还预扣】所以这里单独 catch 而不是让它冒出去：
-            // 一旦它覆盖了原始异常，下面的补偿就不会执行，库存会直接消失且无人知晓。
-            // 取消失败的残留是一条永远停在 PENDING 的订单，只能靠对账的 PENDING 计数发现
-            //（这条链路自愿放弃了 outbox，也就放弃了自动重投的凭据）——因此生产路径不应开启它。
-            try {
-                persistenceService.cancelPending(orderNo);
-            } catch (Exception cancelFailure) {
-                log.error("[降级·取消失败 → 需人工介入] MQ 投递失败后取消预订单也失败了，"
-                                + "该订单会一直停在 PENDING。orderNo={}, stockId={}, userId={}",
-                        orderNo, stockId, userId, cancelFailure);
-            }
-            requireCompensated(stockId, userId, preDeducted, "MQ 投递失败", e);
+            cancelThenCompensate(orderNo, userId, stockId, preDeducted, e);
             throw e;
         }
 
-        queuedCount.incrementAndGet();
+        metrics.onQueued();
         return SeckillOrderResponse.queued(orderNo);
+    }
+
+    /**
+     * 「投递失败」的收尾动作：先取消预订单，再归还预扣。
+     * <p>
+     * 【为什么要单独成一个方法】原先这段是嵌在 {@code catch} 里的两层 {@code try}，
+     * 主流程因此缩进到第四层，而它承担的却是一个很清晰的语义：
+     * 「订单要先不成立，库存才能还回去」。
+     * <p>
+     * 【为什么取消失败不能让它冒出去】一旦它覆盖原始异常，下面的补偿就不会执行，
+     * 库存会直接消失且无人知晓。所以取消失败只记日志，继续走补偿 ——
+     * 残留是一条永远停在 PENDING 的订单，由对账的 PENDING 计数发现
+     * （这条链路自愿放弃了 outbox，也就放弃了自动重投的凭据，因此生产路径不应开启它）。
+     */
+    private void cancelThenCompensate(String orderNo, Long userId, Long stockId,
+                                      boolean preDeducted, Exception cause) {
+        try {
+            persistenceService.cancelPending(orderNo);
+        } catch (Exception cancelFailure) {
+            log.error("[降级·取消失败 → 需人工介入] MQ 投递失败后取消预订单也失败了，"
+                            + "该订单会一直停在 PENDING。orderNo={}, stockId={}, userId={}",
+                    orderNo, stockId, userId, cancelFailure);
+        }
+        requireCompensated(stockId, userId, preDeducted, "MQ 投递失败", cause);
     }
 
     /**
@@ -358,7 +374,7 @@ public class SeckillService {
         if (cause == null) {
             log.warn("[降级] MQ 未启用，预扣已生效，改为同步落库。stockId={}, userId={}", stockId, userId);
         } else {
-            degradedCount.incrementAndGet();
+            metrics.onDegraded();
             log.error("[降级] Redis 不可用，回落 MySQL 条件扣减。stockId={}, userId={}", stockId, userId, cause);
         }
 
@@ -374,7 +390,7 @@ public class SeckillService {
         // 降级路径与请求线程共用同一套「撞唯一索引」判定：两种来源的处置相反，不能各写一遍。
         rejectIfRepeated(outcome, orderNo, userId, stockId, preDeducted, "降级同步落库撞 uk_user_stock");
 
-        successCount.incrementAndGet();
+        metrics.onSyncSuccess();
         return SeckillOrderResponse.success(orderNo);
     }
 
@@ -410,7 +426,7 @@ public class SeckillService {
         // 而后者正是库存静默丢失的来源。
         return switch (compensator.rollbackAll(stockId, userId, DEDUCT_NUM, reason)) {
             case ROLLED_BACK -> {
-                rollbackCount.incrementAndGet();
+                metrics.onRollbackAll();
                 yield true;
             }
             case BENIGN -> true;
@@ -430,7 +446,7 @@ public class SeckillService {
         try {
             RollbackResult result = stockCacheService.restoreStockOnly(stockId, userId, orderNo, DEDUCT_NUM);
             if (result.rolledBack()) {
-                restoreStockOnlyCount.incrementAndGet();
+                metrics.onRestoreStockOnly();
                 log.warn("[回补·仅库存] 多余预扣已回补，已购标记保留。stockId={}, userId={}, orderNo={}, reason={}, remain={}",
                         stockId, userId, orderNo, reason, result.remainStock());
                 return true;
@@ -479,27 +495,7 @@ public class SeckillService {
         stockCacheService.clear(stockId);
     }
 
-    /** 已受理（成功进入 MQ）的下单数 */
-    public int getQueuedCount() {
-        return queuedCount.get();
-    }
-
-    /** 降级路径下同步落库成功的订单数 */
-    public int getSuccessCount() {
-        return successCount.get();
-    }
-
-    public int getDegradedCount() {
-        return degradedCount.get();
-    }
-
-    /** 完整回滚（库存 + 标记）成功次数 */
-    public int getRollbackCount() {
-        return rollbackCount.get();
-    }
-
-    /** 仅回补库存（保留标记）成功次数 */
-    public int getRestoreStockOnlyCount() {
-        return restoreStockOnlyCount.get();
-    }
+    // 本类原先在这里暴露 5 个 getXxxCount() 读 JVM 计数器。现已删除：
+    // 数读 SeckillMetrics.xxxCount()，值本身仍存在（就在 MeterRegistry 里），
+    // /actuator/prometheus 与 /seckill/metrics 读的是同一份，两个出口不可能不一致。
 }

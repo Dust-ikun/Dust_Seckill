@@ -10,8 +10,6 @@ import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.time.LocalDateTime;
-
 /**
  * 秒杀落库服务。
  * <p>
@@ -160,12 +158,7 @@ public class SeckillPersistenceService {
      * 事务里没有任何已生效的写操作，直接返回即可。
      */
     private PersistOutcome insertPendingOrder(String orderNo, Long userId, Long stockId) {
-        Order order = new Order();
-        order.setOrderNo(orderNo);
-        order.setUserId(userId);
-        order.setStockId(stockId);
-        order.setStatus(Order.STATUS_PENDING);
-        order.setCreateTime(LocalDateTime.now());
+        Order order = buildOrder(orderNo, userId, stockId, Order.STATUS_PENDING);
 
         try {
             orderMapper.insert(order);
@@ -280,13 +273,7 @@ public class SeckillPersistenceService {
         //    此时事务里尚无任何变更，直接返回即可；
         // 2) 若先扣库存再插订单，重复消息会先扣掉库存、再因唯一索引冲突而回滚，
         //    白白制造一次「热点行加锁 → 回滚」的开销 —— 而这恰恰是秒杀场景里最贵的操作。
-        Order order = new Order();
-        order.setOrderNo(orderNo);
-        order.setUserId(userId);
-        order.setStockId(stockId);
-        // 降级路径没有后台确认环节，落库即成功。
-        order.setStatus(Order.STATUS_CONFIRMED);
-        order.setCreateTime(LocalDateTime.now());
+        Order order = buildOrder(orderNo, userId, stockId, Order.STATUS_CONFIRMED);
 
         try {
             orderMapper.insert(order);
@@ -305,6 +292,28 @@ public class SeckillPersistenceService {
     }
 
     // ==================================================================== 内部
+
+    /**
+     * 组装一条待插入的订单。两个写入点（{@link #insertPendingOrder} 的 PENDING、
+     * {@link #persist} 的 CONFIRMED）共用它 —— 差别只有 status 一个参数。
+     * <p>
+     * <b>为什么不再设置 {@code createTime}</b>：{@code OrderMapper.insert} 的 SQL 只写
+     * {@code order_no / user_id / stock_id / status} 四列，而 {@code orders.create_time}
+     * 列有 {@code DEFAULT CURRENT_TIMESTAMP}。此前两处都写了 {@code setCreateTime(LocalDateTime.now())}，
+     * 但那行赋值<b>根本进不了数据库</b>（列不在 INSERT 列表里），只是让人误以为应用侧控制了时间。
+     * 删掉它，时间来源就只剩一个真相：数据库默认值。
+     * <p>
+     * 若将来需要应用侧时间（例如要求多实例间时钟可比），必须同时把该列加进 INSERT 语句，
+     * 否则又会回到「赋值了但没生效」的假象。
+     */
+    private Order buildOrder(String orderNo, Long userId, Long stockId, String status) {
+        Order order = new Order();
+        order.setOrderNo(orderNo);
+        order.setUserId(userId);
+        order.setStockId(stockId);
+        order.setStatus(status);
+        return order;
+    }
 
     /**
      * 区分「同一单号重复」与「同一用户重复下单」。
