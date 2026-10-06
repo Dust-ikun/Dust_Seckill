@@ -1,13 +1,11 @@
 package com.dustikun.seckill.Task;
 
 import com.dustikun.seckill.Common.result.ReconcileReport;
-import com.dustikun.seckill.Mq.SeckillMessageProducer;
-import com.dustikun.seckill.Mq.SeckillOrderConsumer;
+import com.dustikun.seckill.Metrics.SeckillMetrics;
 import com.dustikun.seckill.Service.CompensateTaskService;
 import com.dustikun.seckill.Service.OutboxService;
 import com.dustikun.seckill.Service.StockReconcileService;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -33,8 +31,15 @@ public class MaintenanceTask {
     private final CompensateTaskService compensateTaskService;
     private final StockReconcileService stockReconcileService;
     private final OutboxService outboxService;
-    private final ObjectProvider<SeckillMessageProducer> producerProvider;
-    private final ObjectProvider<SeckillOrderConsumer> consumerProvider;
+
+    /**
+     * 在途估算的唯一出口。
+     * <p>
+     * 原先这里注入 {@code ObjectProvider<SeckillMessageProducer/SeckillOrderConsumer>}，
+     * 只为拿两个进程内计数相减；那两个 getter 已随计数器一起迁到 {@link SeckillMetrics}，
+     * 这里也直接改成读它，避免“同一个量在两个地方各数一遍”。
+     */
+    private final SeckillMetrics metrics;
 
     private final int compensateBatchSize;
     private final boolean autoRepair;
@@ -43,8 +48,7 @@ public class MaintenanceTask {
     public MaintenanceTask(CompensateTaskService compensateTaskService,
                            StockReconcileService stockReconcileService,
                            OutboxService outboxService,
-                           ObjectProvider<SeckillMessageProducer> producerProvider,
-                           ObjectProvider<SeckillOrderConsumer> consumerProvider,
+                           SeckillMetrics metrics,
                            @Value("${seckill.maintenance.compensate.batch-size:100}")
                            int compensateBatchSize,
                            @Value("${seckill.maintenance.reconcile.auto-repair:false}")
@@ -54,8 +58,7 @@ public class MaintenanceTask {
         this.compensateTaskService = compensateTaskService;
         this.stockReconcileService = stockReconcileService;
         this.outboxService = outboxService;
-        this.producerProvider = producerProvider;
-        this.consumerProvider = consumerProvider;
+        this.metrics = metrics;
         this.compensateBatchSize = compensateBatchSize;
         this.autoRepair = autoRepair;
         this.reconcileStockIds = reconcileStockIds;
@@ -130,24 +133,21 @@ public class MaintenanceTask {
      * <ol>
      *   <li><b>没有待投递记录</b>：还在 PENDING 的 outbox 记录意味着
      *       这笔预扣确定尚未落库。这一条查的是数据库，多实例也准确。</li>
-     *   <li><b>已投递的消息都已处理完</b>：这一步仍然只能靠单实例的 JVM 计数
-     *       （MQ 的投递/消费进度无法从库里推出来）。要让它跨实例准确，
-     *       需要消费端落库成功后回写 outbox 状态。</li>
+     *   <li><b>已投递的消息都已处理完</b>：这一步仍然只能靠<b>单实例</b>的进程内计数
+     *       （MQ 的投递/消费进度无法从库里推出来；计数现在存在 MeterRegistry 里，
+     *       但仍然是每个实例各数各的 —— 换成 Prometheus 并不会让它自动变跨实例）。
+     *       要让它跨实例准确，需要消费端落库成功后回写 outbox 状态。</li>
      * </ol>
-     * MQ 未启用时（同步降级模式）视为已排空——那条链路上落库是同步完成的，不存在在途。
+     * MQ 未启用时（同步降级模式）两侧计数恒为 0，下面的比较天然判定已排空 ——
+     * 那条链路上落库是同步完成的，本来就不存在在途，因此不必再单独判一次 Bean 是否存在。
      */
     private boolean pipelineDrained(Long stockId) {
         if (outboxService.countPendingByStockId(stockId) > 0) {
             log.debug("[维护任务·对账] stockId={} 仍有待投递记录，本次跳过", stockId);
             return false;
         }
-        SeckillMessageProducer producer = producerProvider.getIfAvailable();
-        SeckillOrderConsumer consumer = consumerProvider.getIfAvailable();
-        if (producer == null || consumer == null) {
-            return true;
-        }
-        long sent = producer.getSentCount();
-        long resolved = consumer.getResolvedCount();
+        long sent = metrics.mqSentCount();
+        long resolved = metrics.resolvedCount();
         return sent <= resolved;
     }
 }

@@ -61,6 +61,28 @@
             <version>4.0.1</version>
         </dependency>
 
+        <!--
+          可观测性：actuator 提供 /actuator/health 等端点与 Micrometer 门面，
+          micrometer-registry-prometheus 提供 Prometheus 文本格式的 /actuator/prometheus。
+
+          【注意这里用哪个 registry】Prometheus Java client 1.x 对应的就是
+          micrometer-registry-prometheus；带 -simpleclient 后缀的那个是 legacy 0.x 分支，
+          两者不能同时引入（会注册出两个同名 MeterRegistry，指标重复上报）。
+
+          【为什么指标要搬到这里】原先所有计数都是各 Service 里的 JVM AtomicInteger：
+          应用重启即归零、多实例各看各的、也没有时间维度算不出 rate()。
+          搬进 Micrometer 之后计数变成 Counter（Prometheus 能识别 counter reset 并正确算增量），
+          数据库事实变成 Gauge，才有做告警规则的地基。
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+
         <dependency>
             <groupId>com.mysql</groupId>
             <artifactId>mysql-connector-j</artifactId>

@@ -4,45 +4,71 @@ import com.dustikun.seckill.Common.Exception.ErrorCode;
 import com.dustikun.seckill.Common.result.ReconcileReport;
 import com.dustikun.seckill.Common.result.Result;
 import com.dustikun.seckill.Common.result.SeckillOrderResponse;
+import com.dustikun.seckill.Metrics.SeckillMetrics;
+import com.dustikun.seckill.Metrics.SeckillMetricsRefresher;
 import com.dustikun.seckill.Mq.SeckillMessageProducer;
-import com.dustikun.seckill.Mq.SeckillOrderConsumer;
-import com.dustikun.seckill.Service.CompensateTaskService;
-import com.dustikun.seckill.Service.OutboxService;
 import com.dustikun.seckill.Service.SeckillService;
 import com.dustikun.seckill.Service.StockReconcileService;
 import org.springframework.beans.factory.ObjectProvider;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
 
+/**
+ * 秒杀业务接口。
+ *
+ * <p><b>本类只放「业务动作」与「给人看的诊断视图」，机器指标不在这里</b>
+ * <p>
+ * 引入 actuator 之后，指标有了两个出口，职责必须划清，否则就会出现「同一个语义数两遍」：
+ * <ul>
+ *   <li><b>{@code /actuator/prometheus}</b>（管理端口 9091，仅本机可达）——给机器：
+ *       有历史、能算 {@code rate()} / {@code increase()}、多实例可聚合，用于告警规则与 Grafana。
+ *       <b>指标的唯一真相在这里</b>。</li>
+ *   <li><b>{@code GET /seckill/metrics}</b>——给人：零依赖、curl 即得、能表达非数值信息
+ *       （如 {@code mqEnabled}）、能把「几个计数放在一起看」得出判断。
+ *       它<b>不再自己维护任何计数器</b>，读的是 {@link SeckillMetrics} 里同一个 {@code MeterRegistry}，
+ *       因此两个出口不可能给出互相矛盾的数字。</li>
+ * </ul>
+ * <p>
+ * 唯一搬不走的是 {@link #reconcile}：它不是一个「读数」，而是一个<b>有副作用的诊断动作</b>
+ * （{@code repair=true} 会直接改写 Redis 库存），返回的是结构化结论文本
+ * （{@code status} 枚举 + 中文 {@code conclusion} + {@code actions} 列表）。
+ * Prometheus 只能存数值，表达不了这种语义，因此它必须留在业务 Controller 上。
+ */
 @RestController
 @RequestMapping("/seckill")
 public class SeckillController {
 
-    @Autowired
-    SeckillService seckillService;
-
-    @Autowired
-    StockReconcileService stockReconcileService;
-
-    @Autowired
-    CompensateTaskService compensateTaskService;
-
-    @Autowired
-    OutboxService outboxService;
+    private final SeckillService seckillService;
+    private final StockReconcileService stockReconcileService;
+    private final SeckillMetrics metrics;
+    private final SeckillMetricsRefresher metricsRefresher;
 
     /**
      * MQ 关闭时该 Bean 不存在，用 ObjectProvider 容忍。
-     * <p>消费者同理：它同样带 {@code @ConditionalOnProperty}，直接注入会导致
-     * {@code seckill.mq.enabled=false} 时应用起不来——而那正是「本机没起 Broker 时调试其它功能」的模式。
+     * <p>只用于回答「MQ 是否启用」这一个问题——原先它和消费者的 getter 一起提供各项计数，
+     * 那些计数已全部迁到 {@link SeckillMetrics}，这里不再参与任何数值计算。
      */
-    @Autowired
-    ObjectProvider<SeckillMessageProducer> producerProvider;
+    private final ObjectProvider<SeckillMessageProducer> producerProvider;
 
-    @Autowired
-    ObjectProvider<SeckillOrderConsumer> consumerProvider;
+    /**
+     * 构造器注入，与项目中所有 Service / Task / Metrics 类的写法保持一致
+     * （原先这里用的是字段级 {@code @Autowired}，是全项目唯一的例外）。
+     * 收益不止是风格统一：字段可以声明为 {@code final}，
+     * 「依赖在构造完成后不再变化」这个事实由此变成编译期保证，而不是口头约定。
+     */
+    public SeckillController(SeckillService seckillService,
+                             StockReconcileService stockReconcileService,
+                             SeckillMetrics metrics,
+                             SeckillMetricsRefresher metricsRefresher,
+                             ObjectProvider<SeckillMessageProducer> producerProvider) {
+        this.seckillService = seckillService;
+        this.stockReconcileService = stockReconcileService;
+        this.metrics = metrics;
+        this.metricsRefresher = metricsRefresher;
+        this.producerProvider = producerProvider;
+    }
 
     /**
      * 秒杀下单。
@@ -129,67 +155,90 @@ public class SeckillController {
         return Result.success("缓存已清理", null);
     }
 
+    /**
+     * 已受理下单数。
+     * <p>
+     * 保留这个窄端点是因为压测脚手架按它取「受理侧计数」（{@code perf_seckill.py}）。
+     * 数据来源与 {@code /metrics} 的 {@code queued} 是同一个 Counter，不会出现两个数。
+     */
     @GetMapping("/count")
     public Result<?> count() {
-        return Result.success("已受理下单数", seckillService.getQueuedCount());
+        return Result.success("已受理下单数", metrics.queuedCount());
     }
 
     /**
-     * 运行态观测。把「请求侧」「待投递侧」「投递侧」「消费侧」「补偿侧」的计数分开看，
-     * 才能判断链路卡在哪一段：
-     * {@code outboxPending} 长期不为零说明投递器追不上或 Broker 不可用；
-     * {@code queued} 远大于 {@code consumed + consumedDuplicate + consumedOrderMissing}
-     * 说明消费跟不上；{@code compensated / compensatePending} 不为零说明有订单落库失败过，
-     * 而 {@code consumedOrderMissing / consumeCancelled} 不为零是真正需要人工过问的信号。
+     * 运行态观测（<b>给人看的</b>视图，不是指标源）。
+     * <p>
+     * 【怎么读它】把「请求侧」「待投递侧」「投递侧」「消费侧」「补偿侧」分开看，才能判断链路卡在哪一段：
+     * <ul>
+     *   <li>{@code outboxPending} 长期不为零 → 投递器追不上，或 Broker 不可用；</li>
+     *   <li>{@code queued} 远大于 {@code consumed + consumedDuplicate + consumedOrderMissing}
+     *       → 消费跟不上（本项目实测的 152~157 单/秒就是这一段的天花板）；</li>
+     *   <li>{@code compensated / compensatePending} 不为零 → 有订单落库失败过；</li>
+     *   <li>{@code consumedOrderMissing / consumeCancelled} 不为零 → 真正需要人工过问的信号。</li>
+     * </ul>
+     * <p>
+     * 【和前端的区别】前两个判断是<b>速率</b>问题，靠这里的累计值是看不出来的——
+     * 判断「现在是不是变慢了」要用 Prometheus 的
+     * {@code rate(seckill_consume_confirmed_total[1m])}。本端点只回答「此刻的总账是多少」。
+     * <p>
+     * 【为什么这里主动刷新一次 Gauge】{@code outboxPending} / {@code outboxFailed} /
+     * {@code compensatePending} 这三个是数据库事实，由定时任务缓存后供 Prometheus 抓取
+     * （默认 30s 一轮，理由是避免「每次 scrape 都全表 COUNT」）。
+     * 但本端点是给人排障用的，值必须是<b>此刻</b>的：所以先主动触发一次刷新——
+     * 与定时任务共用同一段实现，而不是在这里另写一遍查询。
+     * 这样两个出口对同一个量既不会各数一遍，也不会给出不同数字。
      */
     @GetMapping("/metrics")
     public Result<?> metrics() {
-        Map<String, Object> metrics = new LinkedHashMap<>();
+        // 主动刷新，保证下面三个 Gauge 读到的是当下这一刻的库内事实（失败时静默保留旧值）
+        metricsRefresher.refreshGauges();
 
-        // ---- 请求侧 ----
-        metrics.put("queued", seckillService.getQueuedCount());
-        metrics.put("degraded", seckillService.getDegradedCount());
-        metrics.put("rollback", seckillService.getRollbackCount());
-        metrics.put("restoreStockOnly", seckillService.getRestoreStockOnlyCount());
-        metrics.put("syncSuccess", seckillService.getSuccessCount());
+        Map<String, Object> view = new LinkedHashMap<>();
+
+        // ---- 请求侧（Counter：进程内累计，重启归零；要时间维度请看 Prometheus）----
+        view.put("queued", metrics.queuedCount());
+        view.put("degraded", metrics.degradedCount());
+        view.put("rollback", metrics.rollbackAllCount());
+        view.put("restoreStockOnly", metrics.restoreStockOnlyCount());
+        view.put("syncSuccess", metrics.syncSuccessCount());
 
         // ---- 待投递侧 ----
         // outboxPending 是「已受理但消息还没进 Broker」的真实欠账规模，
-        // 它查的是数据库，因此多实例部署下依然准确 —— 这一点优于下面的 JVM 计数器。
-        metrics.put("outboxEnqueued", outboxService.getEnqueuedCount());
-        metrics.put("outboxSent", outboxService.getSentCount());
-        metrics.put("outboxRetried", outboxService.getRetriedCount());
-        metrics.put("outboxAbandoned", outboxService.getAbandonedCount());
-        metrics.put("outboxPurged", outboxService.getPurgedCount());
-        metrics.put("outboxPending", outboxService.countPending());
-        metrics.put("outboxFailed", outboxService.countFailed());
+        // 它来自数据库，因此多实例部署下依然准确 —— 这一点优于上面那些进程内计数。
+        view.put("outboxEnqueued", metrics.outboxEnqueuedCount());
+        view.put("outboxSent", metrics.outboxSentCount());
+        view.put("outboxRetried", metrics.outboxRetriedCount());
+        view.put("outboxAbandoned", metrics.outboxAbandonedCount());
+        view.put("outboxPurged", metrics.outboxPurgedCount());
+        view.put("outboxPending", metrics.outboxPendingGauge());
+        view.put("outboxFailed", metrics.outboxFailedGauge());
 
         // ---- MQ 投递侧 ----
-        SeckillMessageProducer producer = producerProvider.getIfAvailable();
-        metrics.put("mqEnabled", producer != null);
-        metrics.put("mqSent", producer == null ? 0 : producer.getSentCount());
-        metrics.put("mqSendFailed", producer == null ? 0 : producer.getFailedCount());
+        // mqEnabled 是唯一必须留在这里的信息：它是布尔语义，Prometheus 表达不了
+        //（Prometheus 里只有 0/1 的数值，读的人不知道那个 0 是「没启用」还是「启用了但没投递」）。
+        view.put("mqEnabled", producerProvider.getIfAvailable() != null);
+        view.put("mqSent", metrics.mqSentCount());
+        view.put("mqSendFailed", metrics.mqSendFailedCount());
 
         // ---- 消费侧 ----
-        SeckillOrderConsumer consumer = consumerProvider.getIfAvailable();
-        metrics.put("consumed", consumer == null ? 0 : consumer.getConsumedCount());
-        metrics.put("consumedDuplicate", consumer == null ? 0 : consumer.getDuplicateCount());
-        metrics.put("consumedOrderMissing", consumer == null ? 0 : consumer.getOrderMissingCount());
-        metrics.put("consumeCancelled", consumer == null ? 0 : consumer.getCancelledCount());
-        metrics.put("consumeFailed", consumer == null ? 0 : consumer.getFailedCount());
-        metrics.put("compensated", consumer == null ? 0 : consumer.getCompensatedCount());
+        view.put("consumed", metrics.consumeConfirmedCount());
+        view.put("consumedDuplicate", metrics.consumeDuplicateCount());
+        view.put("consumedOrderMissing", metrics.consumeOrderMissingCount());
+        view.put("consumeCancelled", metrics.consumeCancelledCount());
+        view.put("consumeFailed", metrics.consumeFailedCount());
+        view.put("compensated", metrics.consumeStockRestoredCount());
 
         // ---- 在途估算：已投递 − 已处理完。仅单实例视角，多实例下只是粗略提示 ----
-        int sent = producer == null ? 0 : producer.getSentCount();
-        int resolved = consumer == null ? 0 : consumer.getResolvedCount();
-        metrics.put("inFlightEstimate", Math.max(0, sent - resolved));
+        // 注意对账用的是数据库事实（COUNT(orders WHERE status='PENDING')），不依赖这个估算。
+        view.put("inFlightEstimate", Math.max(0, metrics.mqSentCount() - metrics.resolvedCount()));
 
         // ---- 补偿侧 ----
-        metrics.put("compensateEnqueued", compensateTaskService.getEnqueuedCount());
-        metrics.put("compensateRecovered", compensateTaskService.getRecoveredCount());
-        metrics.put("compensateAbandoned", compensateTaskService.getAbandonedCount());
-        metrics.put("compensatePending", compensateTaskService.countPending());
+        view.put("compensateEnqueued", metrics.compensateEnqueuedCount());
+        view.put("compensateRecovered", metrics.compensateRecoveredCount());
+        view.put("compensateAbandoned", metrics.compensateAbandonedCount());
+        view.put("compensatePending", metrics.compensatePendingGauge());
 
-        return Result.success("运行指标", metrics);
+        return Result.success("运行指标", view);
     }
 }

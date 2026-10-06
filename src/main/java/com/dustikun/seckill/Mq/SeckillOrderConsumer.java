@@ -3,6 +3,7 @@ package com.dustikun.seckill.Mq;
 import com.dustikun.seckill.Common.constant.CompensateType;
 import com.dustikun.seckill.Common.result.RollbackResult;
 import com.dustikun.seckill.Config.RocketMqProperties;
+import com.dustikun.seckill.Metrics.SeckillMetrics;
 import com.dustikun.seckill.Service.CompensateTaskService;
 import com.dustikun.seckill.Service.SeckillPersistenceService;
 import com.dustikun.seckill.Service.SeckillPersistenceService.CancelOutcome;
@@ -18,7 +19,6 @@ import org.springframework.stereotype.Component;
 import tools.jackson.databind.ObjectMapper;
 
 import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * 秒杀订单消费者：把「确认订单 + 扣库存」从请求线程搬到独立线程池。
@@ -53,23 +53,28 @@ public class SeckillOrderConsumer implements MessageListenerConcurrently {
     private final CompensateTaskService compensateTaskService;
     private final RocketMqProperties properties;
 
-    private final AtomicInteger consumedCount = new AtomicInteger(0);
-    private final AtomicInteger duplicateCount = new AtomicInteger(0);
-    private final AtomicInteger orderMissingCount = new AtomicInteger(0);
-    private final AtomicInteger cancelledCount = new AtomicInteger(0);
-    private final AtomicInteger failedCount = new AtomicInteger(0);
-    private final AtomicInteger compensatedCount = new AtomicInteger(0);
+    /**
+     * 指标出口。计数不再由本类自己维护。
+     * <p>
+     * 【为什么这一组迁移收益最大】消费侧是本项目真正的瓶颈段（4/8/16 线程排空速率恒为
+     * ~152~157 单/秒，见 docs/压测报告-B轮消费线程调参.md）。原先是 JVM 计数器时，
+     * 只能看到「累计确认了多少」，看不到「现在的确认速率是多少」——
+     * 而判断瓶颈是否被推开，靠的正是 {@code rate(seckill_consume_confirmed_total[1m])}。
+     */
+    private final SeckillMetrics metrics;
 
     public SeckillOrderConsumer(ObjectMapper objectMapper,
                                 SeckillPersistenceService persistenceService,
                                 StockCacheService stockCacheService,
                                 CompensateTaskService compensateTaskService,
-                                RocketMqProperties properties) {
+                                RocketMqProperties properties,
+                                SeckillMetrics metrics) {
         this.objectMapper = objectMapper;
         this.persistenceService = persistenceService;
         this.stockCacheService = stockCacheService;
         this.compensateTaskService = compensateTaskService;
         this.properties = properties;
+        this.metrics = metrics;
     }
 
     @Override
@@ -96,7 +101,7 @@ public class SeckillOrderConsumer implements MessageListenerConcurrently {
 
             switch (outcome) {
                 case CONFIRMED -> {
-                    consumedCount.incrementAndGet();
+                    metrics.onConsumeConfirmed();
                     log.info("[消费·确认成功] orderNo={}, userId={}, stockId={}, 投递到确认耗时={}ms",
                             message.orderNo(), message.userId(), message.stockId(),
                             System.currentTimeMillis() - message.createTime());
@@ -104,14 +109,14 @@ public class SeckillOrderConsumer implements MessageListenerConcurrently {
                 case ALREADY_SETTLED -> {
                     // 同一条消息被重复投递，而订单此前已经确认或取消：本次没有许可证，也无需任何动作。
                     // 绝不能顺手归还库存 —— 那正是「把幂等命中当成失败」的做法，会直接把库存补多。
-                    duplicateCount.incrementAndGet();
+                    metrics.onConsumeDuplicate();
                     log.info("[消费·重复投递] 订单已结案（无许可证），不做任何扣减。orderNo={}, reconsumeTimes={}",
                             message.orderNo(), messageExt.getReconsumeTimes());
                 }
                 case ORDER_MISSING -> {
                     // outbox 有记录、orders 里却没有这条订单：只能是订单行被人工/归档清掉了。
                     // 此时「这笔预扣是否已被消耗」无法判断，不归还库存（少卖方向），并让它显式可见。
-                    orderMissingCount.incrementAndGet();
+                    metrics.onConsumeOrderMissing();
                     log.error("[消费·订单缺失 → 需人工介入] 待投递凭据对应的订单不存在。"
                                     + "orderNo={}, userId={}, stockId={}",
                             message.orderNo(), message.userId(), message.stockId());
@@ -136,7 +141,7 @@ public class SeckillOrderConsumer implements MessageListenerConcurrently {
             return ConsumeConcurrentlyStatus.RECONSUME_LATER;
         }
 
-        failedCount.incrementAndGet();
+        metrics.onConsumeFailed();
         log.error("[消费·重试耗尽] 放弃本条消息：先取消订单，确认取消成功后才归还 Redis 预扣。"
                         + "orderNo={}, userId={}, stockId={}, reconsumeTimes={}",
                 message.orderNo(), message.userId(), message.stockId(), reconsumeTimes, cause);
@@ -164,7 +169,7 @@ public class SeckillOrderConsumer implements MessageListenerConcurrently {
                 // 订单已经（或被之前某次尝试）取消，可以安全归还预扣。
                 // ALREADY_CANCELLED 也不能跳过归还：上一次可能正是在「已取消、未归还」之间崩掉的，
                 // 而归还是幂等的（脚本里的一次性去重键），多做一次没有代价。
-                cancelledCount.incrementAndGet();
+                metrics.onConsumeCancelled();
                 restoreStockOnly(message);
             }
             case CONFIRMED -> {
@@ -205,7 +210,7 @@ public class SeckillOrderConsumer implements MessageListenerConcurrently {
             RollbackResult result = stockCacheService.restoreStockOnly(
                     message.stockId(), message.userId(), message.orderNo(), message.num());
             if (result.rolledBack()) {
-                compensatedCount.incrementAndGet();
+                metrics.onConsumeStockRestored();
                 log.warn("[消费·已取消] 预扣已归还，剩余库存={}，已购标记保留。orderNo={}",
                         result.remainStock(), message.orderNo());
             } else if (result.benign()) {
@@ -238,42 +243,6 @@ public class SeckillOrderConsumer implements MessageListenerConcurrently {
         }
     }
 
-    public int getConsumedCount() {
-        return consumedCount.get();
-    }
-
-    public int getDuplicateCount() {
-        return duplicateCount.get();
-    }
-
-    public int getOrderMissingCount() {
-        return orderMissingCount.get();
-    }
-
-    /** 重试耗尽后成功取消订单的次数（归还库存的尝试随之发起） */
-    public int getCancelledCount() {
-        return cancelledCount.get();
-    }
-
-    public int getFailedCount() {
-        return failedCount.get();
-    }
-
-    /** 归还 Redis 预扣成功的次数 */
-    public int getCompensatedCount() {
-        return compensatedCount.get();
-    }
-
-    /**
-     * 已处理完的消息总数：确认成功 / 重复投递 / 订单缺失 / 重试耗尽后已 ACK。
-     * <p>
-     * 与生产者侧的已投递数相减即可估算「在途消息数」，供对账判断使用。
-     * 注意这是<b>单实例</b>的 JVM 计数，多实例部署时只是粗略提示；
-     * 对账使用的「在途预扣数」已改用数据库事实
-     * {@code COUNT(orders WHERE status='PENDING')}，不依赖本计数。
-     */
-    public int getResolvedCount() {
-        return consumedCount.get() + duplicateCount.get()
-                + orderMissingCount.get() + failedCount.get();
-    }
+    // 本类原先在这里暴露 7 个 getXxxCount() 读 JVM 计数器，现已删除：
+    // 读数请走 SeckillMetrics（含 resolvedCount()，即原来的 getResolvedCount() 口径）。
 }

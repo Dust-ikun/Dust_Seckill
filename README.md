@@ -16,6 +16,7 @@
 | Redis | 6+（Lettuce） | 库存预扣、一人一单去重、Lua 脚本原子扣减 |
 | RocketMQ | 5.3.2（客户端） | 订单落库消息的异步投递 |
 | MyBatis | 4.0.1（starter） | 数据访问层 |
+| Micrometer + Prometheus | Boot 4 自带 | 指标唯一出口（`/actuator/prometheus`，管理端口 9091） |
 | Lombok | — | 样板代码 |
 
 ## 2. 整体架构与请求链路
@@ -64,7 +65,8 @@ src/main/java/com/dustikun/seckill/
 ├── entity/              # Stock / Order / OutboxMessage / CompensateTask
 ├── Config/              # RocketMq / Redis / Outbox / Scheduling 配置
 ├── Task/                # OutboxDispatchTask（投递器+归档）、MaintenanceTask（补偿+对账）
-├── Common/              # Result 统一响应 / 异常 / 常量 / Snowflake 单号生成
+├── Metrics/             # SeckillMetrics（唯一指标出口）+ SeckillMetricsRefresher（Gauge 缓存刷新）
+├── Common/              # Result 统一响应 / 异常 / 常量 / 雪花单号 / 退避策略 / 字符串工具
 └── Bench/               # 压测对照端点（cond vs opt，默认关闭）
 
 src/main/resources/
@@ -95,7 +97,7 @@ src/main/resources/
 | POST | `/seckill/preheat?stockId=` | 活动前把数据库库存前置到 Redis（必须，否则下单返回 1003）；也是降级后重新对齐两边的手段 |
 | GET | `/seckill/remain?stockId=` | 查询 Redis 侧真实可售余量 |
 | DELETE | `/seckill/cache?stockId=` | 活动结束后清理 Redis 活动缓存 |
-| GET | `/stock/{id}` | 查询数据库侧库存 |
+| GET | `/stock/{id}` | 查询**数据库侧**库存（账本，非可售余量）。与 `/seckill/remain` 的区别：后者才是当下真实可售余量，两者在活动期间不相等是正常的中间状态 |
 
 ### 运维接口
 
@@ -175,8 +177,14 @@ mvn test
 
 1. **INSERT 之前仍有窗口**：进程在「Redis 已扣、预订单未写」之间消失，该预扣无持久化记录。窗口已缩至一次本地事务提交，彻底消除需预扣本身可恢复，属另一层取舍。
 2. **对账结果未落库**：发现不一致只写日志，历史不可回溯。
-3. **消费完成不回写 outbox**：「已投出未消费」只能靠单实例 JVM 计数判断。
-4. **指标为 JVM 内存计数器**：重启归零、多实例各看各的（数据库侧 `countPending/countFailed` 已可查询）。
+3. **消费完成不回写 outbox**：「已投出未消费」只能靠单实例进程内计数判断
+   （`MaintenanceTask#pipelineDrained` 用 `mqSentCount() - resolvedCount()` 估算）。
+4. **指标的两个残余局限**（已迁 Micrometer，这两条是迁移后剩下的）：
+   - Gauge（`outbox.pending` / `outbox.failed` / `compensate.pending`）走本地缓存 + 30s 定时刷新，
+     最多滞后一个刷新周期——对「欠账规模」这类慢变量够用，但不适合做秒级告警；
+   - `/seckill/metrics` 里的 `inFlightEstimate` 仍是**单实例**视角的估算（`mqSent - resolved`）。
+     对账不受影响：它用的在途数是数据库事实 `COUNT(orders WHERE status='PENDING')`。
 5. **多实例重复投递**：不做抢占（SKIP LOCKED / claim），重复投递由消费端 `uk_order_no` 幂等吸收，换来零并发控制复杂度；如需消除只需替换 `OutboxMessageMapper.selectPending` 一处。
 
-后续方向：对账结果落库 + 告警、Micrometer/Prometheus 指标、活动起止时间自动化、消费完成回写 outbox（全链路台账）、评估 Redis Stream 版激进方案。
+后续方向：对账结果落库 + 告警、活动起止时间自动化、消费完成回写 outbox（全链路台账 +
+让 `pipelineDrained` 跨实例准确）、评估 Redis Stream 版激进方案。
