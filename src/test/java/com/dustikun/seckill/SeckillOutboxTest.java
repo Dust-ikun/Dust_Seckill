@@ -2,12 +2,16 @@ package com.dustikun.seckill;
 
 import com.dustikun.seckill.Config.OutboxProperties;
 import com.dustikun.seckill.Config.RocketMqProperties;
+import com.dustikun.seckill.Mapper.OrderMapper;
 import com.dustikun.seckill.Mapper.OutboxMessageMapper;
 import com.dustikun.seckill.Metrics.SeckillMetrics;
 import com.dustikun.seckill.Mq.SeckillMessageProducer;
+import com.dustikun.seckill.Service.CompensateTaskService;
+import com.dustikun.seckill.Service.OutboxAbandonService;
 import com.dustikun.seckill.Service.OutboxService;
 import com.dustikun.seckill.Service.PreDeductCompensator;
 import com.dustikun.seckill.Service.StockCacheService;
+import com.dustikun.seckill.entity.Order;
 import com.dustikun.seckill.entity.OutboxMessage;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import lombok.extern.slf4j.Slf4j;
@@ -51,6 +55,20 @@ class SeckillOutboxTest {
     private OutboxMessageMapper outboxMapper;
     @Autowired
     private PreDeductCompensator compensator;
+
+    /**
+     * 放弃投递走的是它（FAILED + 归还待办同事务），以及执行归还的待补偿任务链路。
+     * <p>
+     * 两者都必须是<b>容器里的 Bean</b>而不是手工 new 出来的实例：
+     * {@code @Transactional} 靠代理生效，手工 new 出来的对象没有事务，
+     * 测出来的就只是「两句 SQL 恰好都成功了」。
+     */
+    @Autowired
+    private OutboxAbandonService outboxAbandonService;
+    @Autowired
+    private CompensateTaskService compensateTaskService;
+    @Autowired
+    private OrderMapper orderMapper;
     @Autowired
     private StockCacheService stockCacheService;
     @Autowired
@@ -89,6 +107,10 @@ class SeckillOutboxTest {
     private void clean() {
         jdbcTemplate.update("DELETE FROM seckill_outbox WHERE stock_id = ?", STOCK_ID);
         jdbcTemplate.update("DELETE FROM compensate_task WHERE stock_id = ?", STOCK_ID);
+        // 放弃投递的用例必须造出订单行（真实链路里它与 outbox 同事务写入），
+        // 而 orders 上有 uk_user_stock：不清理会让「同一用户 + 同一活动」在下一次运行时
+        // 直接撞唯一索引，表现为与本用例无关的 DuplicateKeyException。
+        jdbcTemplate.update("DELETE FROM orders WHERE stock_id = ?", STOCK_ID);
     }
 
     // ============================================================ 写入与查询
@@ -134,22 +156,33 @@ class SeckillOutboxTest {
     }
 
     @Test
-    @DisplayName("重试耗尽应放弃并回补 Redis 预扣：宁可让用户重抢，也不能让库存凭空消失")
+    @DisplayName("重试耗尽应放弃并归还预扣：归还与 FAILED 同事务落库，进程消失也追得回来")
     void exhaustedRetryShouldAbandonAndRestoreRedis() {
         String orderNo = "OUTBOX-C-" + System.nanoTime();
+        long userId = 600003L;
         OutboxService failing = failingOutboxWithMaxRetry(2);
 
         stockCacheService.preheat(STOCK_ID);
-        stockCacheService.tryDeduct(STOCK_ID, 600003L, 1);
+        stockCacheService.tryDeduct(STOCK_ID, userId, 1);
         assertEquals(INIT_STOCK - 1, stockCacheService.remain(STOCK_ID), "预扣应已生效");
 
-        outboxService.enqueue(orderNo, 600003L, STOCK_ID, 1);
+        // 【必须造出订单行】真实链路上「orders(PENDING) + seckill_outbox」是同一个事务写进去的。
+        // 旧版本这个用例只 enqueue 了 outbox 行、没有订单行，恰好绕过了「订单仍停在 PENDING」
+        // 这个真实状态 —— 而放弃路径的整个难点都在那个状态上（它会污染对账的在途口径）。
+        Order order = new Order();
+        order.setOrderNo(orderNo);
+        order.setUserId(userId);
+        order.setStockId(STOCK_ID);
+        order.setStatus(Order.STATUS_PENDING);
+        orderMapper.insert(order);
+
+        outboxService.enqueue(orderNo, userId, STOCK_ID, 1);
 
         // 第 1 次：失败 → 退避
         failing.dispatchDue(10);
         assertEquals(OutboxMessage.STATUS_PENDING, outboxService.findByOrderNo(orderNo).getStatus());
 
-        // 第 2 次：达到 max-retry → 放弃 + 回补
+        // 第 2 次：达到 max-retry → 同一事务里「标记 FAILED + 登记归还待办」→ 立刻执行归还
         makeDue(orderNo);
         failing.dispatchDue(10);
 
@@ -157,9 +190,47 @@ class SeckillOutboxTest {
         assertEquals(OutboxMessage.STATUS_FAILED, after.getStatus(), "重试耗尽应标记为 FAILED");
         assertEquals(INIT_STOCK, stockCacheService.remain(STOCK_ID),
                 "放弃投递后必须归还 Redis 预扣，否则这件库存就永久少卖了");
-        assertFalse(stockCacheService.isBought(STOCK_ID, 600003L),
-                "完整回滚应摘掉用户标记，用户必须能重新抢");
         assertTrue(outboxService.countFailed() >= 1, "FAILED 规模应当可被查询到（用于告警）");
+
+        // 归还动作必须先让订单不成立：否则重投仍可能拿到许可证并真实扣减库存 → 超卖
+        assertEquals(Order.STATUS_CANCELLED, orderMapper.selectByOrderNo(orderNo).getStatus(),
+                "放弃投递必须先取消订单，否则它会永远停在 PENDING、查单永远返回处理中");
+        // 标记保留：该用户在 orders 里还有一行订单，摘掉只会被对账当成 MARK_MISSING 再加回来
+        assertTrue(stockCacheService.isBought(STOCK_ID, userId),
+                "订单行仍在，已购标记就必须保留（摘了就是自相矛盾的状态）");
+        // 归还待办已经落库并了结 —— 这正是「崩溃也追得回来」的那份凭据
+        assertEquals(0, compensateTaskService.countUnresolvedByStockId(STOCK_ID),
+                "归还待办应当已经执行完毕（DONE），不留未了结义务给对账去发现");
+    }
+
+    @Test
+    @DisplayName("放弃投递的归还待办与 FAILED 同事务：待办插入失败时两者都不成立，记录退回 PENDING")
+    void abandonShouldNotLeavenFailedWithoutItsReleaseTask() {
+        String orderNo = "OUTBOX-J-" + System.nanoTime();
+        long userId = 600013L;
+
+        stockCacheService.preheat(STOCK_ID);
+        stockCacheService.tryDeduct(STOCK_ID, userId, 1);
+
+        Order order = new Order();
+        order.setOrderNo(orderNo);
+        order.setUserId(userId);
+        order.setStockId(STOCK_ID);
+        order.setStatus(Order.STATUS_PENDING);
+        orderMapper.insert(order);
+
+        outboxService.enqueue(orderNo, userId, STOCK_ID, 1);
+        OutboxMessage message = outboxService.findByOrderNo(orderNo);
+
+        // 让待办插入必然失败：user_id 是 NOT NULL，传 null 会被数据库直接拒绝。
+        // 这模拟的是「登记待办那一步没成功」——此时绝不能把记录改成 FAILED。
+        assertThrows(Exception.class, () -> outboxAbandonService.abandon(
+                message.getId(), "测试构造：待办插入必然失败", STOCK_ID, null, orderNo, 1));
+
+        assertEquals(OutboxMessage.STATUS_PENDING, outboxService.findByOrderNo(orderNo).getStatus(),
+                "待办没落库，FAILED 也必须回滚：否则就成了一条「已放弃、无人归还」的记录");
+        assertEquals(INIT_STOCK - 1, stockCacheService.remain(STOCK_ID),
+                "归还待办没成立之前，库存也不该被归还（否则重投会与归还同时发生 → 超卖）");
     }
 
     @Test
@@ -267,7 +338,8 @@ class SeckillOutboxTest {
         properties.setFirstRetryDelaySeconds(1);
         properties.setBatchSize(50);
 
-        return new OutboxService(outboxMapper, fixedProvider(broken), compensator, properties, newMetrics());
+        return new OutboxService(outboxMapper, fixedProvider(broken), outboxAbandonService,
+                compensateTaskService, properties, newMetrics());
     }
 
     /**

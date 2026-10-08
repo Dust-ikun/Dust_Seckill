@@ -7,6 +7,7 @@ import com.dustikun.seckill.Mapper.OutboxMessageMapper;
 import com.dustikun.seckill.Metrics.SeckillMetrics;
 import com.dustikun.seckill.Mq.SeckillMessage;
 import com.dustikun.seckill.Mq.SeckillMessageProducer;
+import com.dustikun.seckill.entity.CompensateTask;
 import com.dustikun.seckill.entity.OutboxMessage;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
@@ -26,7 +27,8 @@ import java.util.List;
  *
  * Outbox（窗口收窄）    请求线程：Redis 预扣 → 【写入 outbox】→ 返回已受理
  *                                      ↑ 写进库了，就不再依赖请求线程活着
- *                      后台投递器：扫 outbox → 投 MQ → 标记 SENT → 失败退避重试 → 耗尽则回补
+ *                      后台投递器：扫 outbox → 投 MQ → 标记 SENT → 失败退避重试
+ *                                  → 耗尽则「同一事务里标记 FAILED + 登记归还待办」→ 立刻尝试归还
  * </pre>
  *
  * 【它真正买到了什么，以及仍然买不到什么】
@@ -39,6 +41,8 @@ import java.util.List;
  *       请求线程要消失，必须恰好落在 Redis 预扣与这条 INSERT 之间。</li>
  *   <li><b>欠账可观测</b>：{@code PENDING} 的条数就是「已受理但还没投出去」的真实规模，
  *       可以查询、可以告警，不再依赖 JVM 内存计数器。</li>
+ *   <li><b>放弃投递不再是「一次内存里的调用」</b>：归还预扣这件事与 FAILED 同事务落库
+ *       （见 {@link OutboxAbandonService}），因此进程在归还之前消失也追得回来。</li>
  * </ol>
  * <p>
  * 仍然买不到（必须如实说明）：<b>这条 INSERT 之前的窗口依然存在</b>。
@@ -56,7 +60,16 @@ public class OutboxService {
 
     private final OutboxMessageMapper outboxMapper;
     private final ObjectProvider<SeckillMessageProducer> producerProvider;
-    private final PreDeductCompensator compensator;
+
+    /**
+     * 「放弃投递」的落库点（FAILED + 归还待办同事务）。
+     * <p>
+     * 本类原先直接持有 {@code PreDeductCompensator}：放弃时先改状态、再在内存里调一次回补。
+     * 那一步既不是原子的、也没有留下任何持久化痕迹，是「标记失败之后进程消失就永久少卖」的成因。
+     * 现在改由本类<b>只负责登记</b>，执行交给待补偿任务链路 —— 它独立于调用线程的生命周期。
+     */
+    private final OutboxAbandonService abandonService;
+    private final CompensateTaskService compensateTaskService;
     private final OutboxProperties properties;
 
     /**
@@ -68,12 +81,14 @@ public class OutboxService {
 
     public OutboxService(OutboxMessageMapper outboxMapper,
                          ObjectProvider<SeckillMessageProducer> producerProvider,
-                         PreDeductCompensator compensator,
+                         OutboxAbandonService abandonService,
+                         CompensateTaskService compensateTaskService,
                          OutboxProperties properties,
                          SeckillMetrics metrics) {
         this.outboxMapper = outboxMapper;
         this.producerProvider = producerProvider;
-        this.compensator = compensator;
+        this.abandonService = abandonService;
+        this.compensateTaskService = compensateTaskService;
         this.properties = properties;
         this.metrics = metrics;
     }
@@ -188,23 +203,7 @@ public class OutboxService {
         int attempts = message.getRetryCount() == null ? 0 : message.getRetryCount();
 
         if (attempts + 1 >= properties.getMaxRetry()) {
-            // 先写「已放弃」，再回补库存 —— 顺序不能反。
-            // 反过来的话，若在回补与改状态之间进程消失，这条记录仍会被投递器捞起来重投，
-            // 于是「库存已归还」与「订单随后落库」同时发生，变成超卖。
-            // 按现在的顺序，最坏情况是预扣泄漏（少卖），而对账能发现它；两者代价不对称，
-            // 因此顺序选择应当明确偏向「宁可少卖，绝不超卖」。
-            outboxMapper.markFailed(message.getId(), error);
-            metrics.onOutboxAbandoned();
-            log.error("[Outbox·放弃 → 需人工介入] 重试 {} 次仍无法投递，已回补 Redis 预扣。"
-                            + "orderNo={}, stockId={}, userId={}, lastError={}",
-                    attempts + 1, message.getOrderNo(), message.getStockId(), message.getUserId(), error);
-
-            PreDeductCompensator.Outcome outcome = compensator.rollbackAll(
-                    message.getStockId(), message.getUserId(), message.getNum(), "Outbox 投递重试耗尽");
-            if (outcome == PreDeductCompensator.Outcome.FAILED) {
-                log.error("[Outbox·放弃] 回补未成功，已登记待补偿任务，请关注 compensatePending。orderNo={}",
-                        message.getOrderNo());
-            }
+            abandon(message, error, attempts + 1);
             return;
         }
 
@@ -213,6 +212,57 @@ public class OutboxService {
         metrics.onOutboxRetried();
         log.warn("[Outbox·退避重试] 第 {} 次投递失败，将于 {} 重试。orderNo={}, error={}",
                 attempts + 1, next, message.getOrderNo(), error);
+    }
+
+    /**
+     * 重试耗尽：放弃这条记录，并让「归还这笔预扣」成为一条与 FAILED 同事务落库的待办。
+     * <p>
+     * 【为什么不再在这里直接回补 Redis】
+     * 旧写法是「{@code markFailed}（自动提交）→ 调 {@code PreDeductCompensator} 回补」。
+     * 顺序本身是对的（先放弃、后归还，反过来会让投递器把已归还的记录重新投出去），
+     * 但它把<b>归还动作</b>放在了事务之外、进程之内：这两步之间进程消失，
+     * 库里只留下一条 FAILED，Redis 里那件库存再没人归还，而且对账也看不出来 ——
+     * 订单仍是 PENDING，会被算作「正常在途」，等式两边一起偏，结论是 CONSISTENT。
+     * <p>
+     * 现在拆成两步，且<b>顺序不可颠倒</b>：
+     * <ol>
+     *   <li>{@link OutboxAbandonService#abandon}：同一个事务里写 FAILED + 写归还待办。
+     *       崩在任何一处，要么回到「还是 PENDING、继续重试」，要么两条都已落库；</li>
+     *   <li>{@link CompensateTaskService#executeNow}：事务提交后立刻尝试执行一次。
+     *       这只是<b>时延优化</b>，不是正确性的组成部分 —— 失败或崩溃都由 MaintenanceTask 接管。</li>
+     * </ol>
+     */
+    private void abandon(OutboxMessage message, String error, int attempts) {
+        CompensateTask task;
+        try {
+            task = abandonService.abandon(message.getId(), error, message.getStockId(),
+                    message.getUserId(), message.getOrderNo(), message.getNum());
+        } catch (Exception abandonFailure) {
+            // 事务整体回滚了：记录退回 PENDING，下一轮投递会再试一次放弃。
+            // 这里绝不能「接着把库存还了」—— 状态没改成功就意味着这条记录仍会被投递器捞起来重投，
+            // 那时「库存已归还」与「订单随后落库」同时发生，就是超卖。
+            log.error("[Outbox·放弃失败] FAILED 与归还待办未落库，记录仍在 PENDING，将重新尝试放弃。"
+                            + "orderNo={}, stockId={}, userId={}, lastError={}",
+                    message.getOrderNo(), message.getStockId(), message.getUserId(), error, abandonFailure);
+            return;
+        }
+
+        if (task == null) {
+            // 记录已被别的实例投出/放弃：本次不是「放弃」，因此不归还库存
+            log.warn("[Outbox·放弃] 记录已由其它路径处理，本次不归还预扣。orderNo={}", message.getOrderNo());
+            return;
+        }
+
+        metrics.onOutboxAbandoned();
+        log.error("[Outbox·放弃 → 需人工介入] 重试 {} 次仍无法投递，已登记「取消订单 + 归还预扣」待办"
+                        + "（id={}）。orderNo={}, stockId={}, userId={}, lastError={}",
+                attempts, task.getId(), message.getOrderNo(), message.getStockId(),
+                message.getUserId(), error);
+
+        if (!compensateTaskService.executeNow(task)) {
+            log.error("[Outbox·放弃] 本次归还未成功，已由待补偿任务按退避重试（请关注 compensatePending）。"
+                    + "orderNo={}, taskId={}", message.getOrderNo(), task.getId());
+        }
     }
 
     /**

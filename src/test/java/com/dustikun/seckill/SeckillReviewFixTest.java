@@ -6,12 +6,14 @@ import com.dustikun.seckill.Common.result.ReconcileReport;
 import com.dustikun.seckill.Common.result.RollbackResult;
 import com.dustikun.seckill.Mapper.CompensateTaskMapper;
 import com.dustikun.seckill.Mapper.OrderMapper;
+import com.dustikun.seckill.Mapper.OutboxMessageMapper;
 import com.dustikun.seckill.Service.CompensateTaskService;
 import com.dustikun.seckill.Service.SeckillPersistenceService;
 import com.dustikun.seckill.Service.SeckillPersistenceService.PersistOutcome;
 import com.dustikun.seckill.Service.StockCacheService;
 import com.dustikun.seckill.Service.StockReconcileService;
 import com.dustikun.seckill.entity.Order;
+import com.dustikun.seckill.entity.OutboxMessage;
 import lombok.extern.slf4j.Slf4j;
 import org.junit.jupiter.api.*;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -57,6 +59,8 @@ class SeckillReviewFixTest {
     @Autowired
     private CompensateTaskMapper compensateTaskMapper;
     @Autowired
+    private OutboxMessageMapper outboxMapper;
+    @Autowired
     private StringRedisTemplate redisTemplate;
     @Autowired
     private JdbcTemplate jdbcTemplate;
@@ -89,6 +93,9 @@ class SeckillReviewFixTest {
                 STOCK_ID, "评审修复测试商品", INIT_STOCK, INIT_STOCK);
         jdbcTemplate.update("DELETE FROM orders WHERE stock_id = ?", STOCK_ID);
         jdbcTemplate.update("DELETE FROM compensate_task WHERE stock_id = ?", STOCK_ID);
+        // 对账的在途口径会去关联 seckill_outbox（「已投递放弃」是记在那里的），
+        // 因此这里必须一并清理 —— 否则上一条用例留下的 FAILED 记录会污染下一条的在途数。
+        jdbcTemplate.update("DELETE FROM seckill_outbox WHERE stock_id = ?", STOCK_ID);
         stockCacheService.clear(STOCK_ID);
     }
 
@@ -99,6 +106,7 @@ class SeckillReviewFixTest {
         }
         jdbcTemplate.update("DELETE FROM orders WHERE stock_id = ?", STOCK_ID);
         jdbcTemplate.update("DELETE FROM compensate_task WHERE stock_id = ?", STOCK_ID);
+        jdbcTemplate.update("DELETE FROM seckill_outbox WHERE stock_id = ?", STOCK_ID);
         jdbcTemplate.update("DELETE FROM stock WHERE id = ?", STOCK_ID);
         stockCacheService.clear(STOCK_ID);
     }
@@ -325,6 +333,85 @@ class SeckillReviewFixTest {
                 "AUTO 模式的结论应直接指认泄漏，而不是模棱两可的「中间状态」");
     }
 
+    // ================================================================ 对账改进：已放弃但未了结的预订单
+
+    @Test
+    @DisplayName("对账改进：投递已放弃但仍为 PENDING 的记录必须报出来，且不许对账自己改库存")
+    void reconcileShouldReportAbandonedPendingAndLetTaskRestoreStock() {
+        stockCacheService.preheat(STOCK_ID);                 // Redis = 100, stock.count = 100
+        long userId = 800020L;
+        String orderNo = "RVT-ABANDON-" + System.nanoTime();
+
+        // 构造「标记失败之后进程消失」的现场：Redis 已预扣、订单是 PENDING、outbox 是 FAILED，
+        // 而归还从未发生（没有任何待补偿任务）。这正是旧口径下被读成 CONSISTENT 的那一笔 ——
+        // 崩溃前后对账读到的每个输入都没变，所以它连差值都看不到。
+        stockCacheService.tryDeduct(STOCK_ID, userId, 1);    // Redis = 99
+        insertPendingOrder(orderNo, userId);
+        markOutboxFailed(orderNo, userId);
+
+        // 旧口径：期望 = 100 − 1(PENDING) = 99 = Redis → 「一致」，库存永久少卖且无人知晓。
+        // 新口径：这条 PENDING 已被放弃、不是在途 → 期望 = 100 − 0 = 100 > 99 → 必须报出来。
+        ReconcileReport detected = stockReconcileService.reconcile(STOCK_ID, false);
+        assertEquals(ReconcileReport.Status.ABANDONED_PENDING, detected.status(),
+                "已放弃但未了结的预订单必须被单独报出来，而不是被算作正常在途");
+        assertEquals(1, detected.abandonedPending());
+        assertEquals(0, detected.expectedInFlight(), "已放弃的预订单不算在途");
+        assertFalse(detected.repaired(), "repair=false 时只报告不动数据");
+
+        // repair=true：为它补登记「取消订单 + 归还预扣」待办，但绝不对账自己改库存
+        ReconcileReport repaired = stockReconcileService.reconcile(STOCK_ID, true);
+        assertEquals(ReconcileReport.Status.ABANDONED_PENDING, repaired.status());
+        assertTrue(repaired.repaired(), "应为已放弃记录补登记归还待办");
+        assertEquals(INIT_STOCK - 1, stockCacheService.remain(STOCK_ID),
+                "对账不得直接改写库存：归还由待办任务完成，两处都改会把同一件库存归还两次");
+        assertTrue(compensateTaskService.orderNosWithTask(STOCK_ID).contains(orderNo),
+                "已放弃记录必须有一条可查、可重试的归还待办");
+
+        // 待办真正跑完：先取消订单，再归还预扣
+        makeDue();
+        compensateTaskService.retryDue(100);
+
+        assertEquals(Order.STATUS_CANCELLED, orderMapper.selectByOrderNo(orderNo).getStatus(),
+                "归还之前必须先把订单取消，否则它会永远停在 PENDING、查单永远返回处理中");
+        assertEquals(INIT_STOCK, stockCacheService.remain(STOCK_ID), "预扣应被归还");
+        assertTrue(stockCacheService.isBought(STOCK_ID, userId),
+                "订单行仍在，已购标记就必须保留（摘了就是自相矛盾，对账还会再加回来）");
+
+        // 了结之后再对账：既无已放弃记录、也无悬空归还义务，等式必须成立
+        ReconcileReport settled = stockReconcileService.reconcile(STOCK_ID, false);
+        assertEquals(ReconcileReport.Status.CONSISTENT, settled.status(),
+                "了结之后应当真正一致（dbStock 仍是 100，Redis 也已回到 100）");
+        assertEquals(0, settled.abandonedPending());
+    }
+
+    @Test
+    @DisplayName("对账改进：归还已完成的已放弃记录不得被误报成 REDIS_AHEAD，更不得被再扣一次")
+    void reconcileShouldNotMisreadRestoredAbandonedPrededuct() {
+        stockCacheService.preheat(STOCK_ID);
+        long userId = 800021L;
+        String orderNo = "RVT-RESTORED-" + System.nanoTime();
+
+        stockCacheService.tryDeduct(STOCK_ID, userId, 1);    // Redis = 99
+        insertPendingOrder(orderNo, userId);
+        markOutboxFailed(orderNo, userId);
+        // 归还已经完成（待补偿任务跑过，或人工补过），只是订单还挂在 PENDING：
+        // 库存差额为 0，但订单永远「处理中」。
+        stockCacheService.restoreStockOnly(STOCK_ID, userId, orderNo, 1);
+        assertEquals(INIT_STOCK, stockCacheService.remain(STOCK_ID));
+
+        ReconcileReport report = stockReconcileService.reconcile(STOCK_ID, true);
+        assertEquals(ReconcileReport.Status.ABANDONED_PENDING, report.status(),
+                "有记录可证明归还已经完成，就不该按库存差额判成 REDIS_AHEAD（那是降级写库的判据）");
+        assertEquals(INIT_STOCK, stockCacheService.remain(STOCK_ID),
+                "repair 更不得把它再扣一次 —— 那等于把已经做好的补偿反向撤销");
+
+        // 待办与对账都不会重复归还：restoreStockOnly 的一次性去重键为「活动 + 单号」
+        makeDue();
+        compensateTaskService.retryDue(100);
+        assertEquals(INIT_STOCK, stockCacheService.remain(STOCK_ID),
+                "重复归还就是库存虚增（超卖方向），去重键必须先于 INCRBY 生效");
+    }
+
     // ================================================================ 评审问题 5 / 7
 
     @Test
@@ -379,5 +466,40 @@ class SeckillReviewFixTest {
         Integer count = jdbcTemplate.queryForObject(
                 "SELECT count FROM stock WHERE id = ?", Integer.class, STOCK_ID);
         return count == null ? -1 : count;
+    }
+
+    /**
+     * 造一条 PENDING 预订单。真实链路上它与 {@code seckill_outbox} 那一行是同一个事务写入的，
+     * 所以凡是构造「投递侧现场」的用例都必须同时造出它 —— 只造 outbox 行会绕过
+     * 「订单仍停在 PENDING」这个真实状态。
+     * <p>
+     * 不设 {@code createTime}：{@code OrderMapper.insert} 的 SQL 里没有这一列，
+     * 赋值进不了数据库，只会让人误以为应用侧控制了时间（见 {@code SeckillPersistenceService}）。
+     */
+    private void insertPendingOrder(String orderNo, long userId) {
+        Order order = new Order();
+        order.setOrderNo(orderNo);
+        order.setUserId(userId);
+        order.setStockId(STOCK_ID);
+        order.setStatus(Order.STATUS_PENDING);
+        orderMapper.insert(order);
+    }
+
+    /**
+     * 造一条「投递重试耗尽」的 outbox 记录：先按真实写入路径落一条 PENDING，再置为 FAILED。
+     * <p>
+     * 走 {@code markFailed} 而不是直接写 SQL，是为了顺带锁住它的状态守卫（只有 PENDING 能被翻成
+     * FAILED）—— 那正是多实例同时放弃同一条记录时，决定谁有资格登记归还待办的那道闸门。
+     */
+    private void markOutboxFailed(String orderNo, long userId) {
+        OutboxMessage message = new OutboxMessage();
+        message.setOrderNo(orderNo);
+        message.setUserId(userId);
+        message.setStockId(STOCK_ID);
+        message.setNum(1);
+        message.setNextRetryTime(LocalDateTime.now().minusSeconds(1));
+        outboxMapper.insert(message);
+        assertEquals(1, outboxMapper.markFailed(message.getId(), "单测构造：投递重试耗尽"),
+                "只有 PENDING 记录才能被放弃");
     }
 }

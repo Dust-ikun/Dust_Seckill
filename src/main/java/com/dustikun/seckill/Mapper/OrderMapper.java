@@ -85,24 +85,28 @@ public interface OrderMapper {
      * 某活动处于 PENDING（在途）的订单数。
      * <p>
      * 对账（AUTO 模式）用它当「在途预扣数」：期望 Redis 库存 = 数据库库存 − 本值。
-     * 注意对账快照走 {@link #selectReconcileSnapshot}（三个数同一条 SQL 取同一时刻），
-     * 本方法用于单独查询与测试。
+     * 注意对账快照走 {@link #selectReconcileSnapshot}（四个数同一条 SQL 取同一时刻，
+     * 且会把「已放弃但仍为 PENDING」的那些剔出去），本方法用于单独查询与测试。
      * 走 {@code idx_orders_stock_status} 索引。
      */
     @Select("SELECT COUNT(*) FROM orders WHERE stock_id = #{stockId} AND status = 'PENDING'")
     int countPendingByStockId(@Param("stockId") Long stockId);
 
     /**
-     * 对账快照：一条 SQL 同时取回「数据库库存 / PENDING 预订单数 / 订单总数」。
+     * 对账快照：一条 SQL 同时取回「数据库库存 / PENDING 预订单数 / 已放弃未了结数 / 订单总数」。
      * <p>
      * 对账的不变量是 {@code Redis 库存 == 数据库库存 − 在途预扣数}，等式两边的数据库侧
      * 必须来自同一时刻——分成两条查询时，间隙里落库的订单会自己制造假不一致。
      * 标量子查询在同一个语句里读到的是同一份一致性视图，天然满足这一点。
      * <p>
-     * 【为什么用 PENDING 订单数做在途数】订单前置之后，每一笔受理都会留下一条
+     * 【在途数为什么是 PENDING 减去「已放弃」】订单前置之后，每一笔受理都会留下一条
      * PENDING 预订单，消费确认（PENDING → CONFIRMED + 扣库存）在同一事务里完成，
-     * 所以「Redis 已扣、数据库尚未扣」的差额恰好等于 PENDING 行数——
-     * 在途不再是 JVM 计数器或人工声明，而是可以直接查库的事实。
+     * 所以「Redis 已扣、数据库尚未扣」的差额等于 PENDING 行数 —— 但这条推理有一个前提：
+     * <b>每条 PENDING 最终都会走向 CONFIRMED 或 CANCELLED</b>。投递重试耗尽的记录打破了这个前提：
+     * 它的消息不会再被投出去（在 outbox 里是 FAILED 终态），订单却停在 PENDING。
+     * 这种单既不会落库、也不会取消，把它算进在途就等于给等式两边各减 1 —— 差值被抵消，
+     * 一笔真正丢失的预扣会被读成「一致」。所以它必须被单独数出来并从在途里剔掉：
+     * 见 {@code ReconcileReport.Status#ABANDONED_PENDING}。
      * <p>
      * 快照里只有数据库：Redis 侧的库存在本方法之外单独读取
      * （它本来就不是数据库事务的一部分，且注意先取快照后读 Redis 的读偏斜窗口，见对账服务注释）。
@@ -110,6 +114,23 @@ public interface OrderMapper {
     @Select("SELECT"
             + " (SELECT count FROM stock WHERE id = #{stockId}) AS dbStock,"
             + " (SELECT COUNT(*) FROM orders WHERE stock_id = #{stockId} AND status = 'PENDING') AS pendingOrders,"
+            + " (SELECT COUNT(*) FROM orders o JOIN seckill_outbox x ON x.order_no = o.order_no"
+            + "     WHERE o.stock_id = #{stockId} AND o.status = 'PENDING' AND x.status = 'FAILED')"
+            + "   AS abandonedPending,"
             + " (SELECT COUNT(*) FROM orders WHERE stock_id = #{stockId}) AS dbOrderCount")
     com.dustikun.seckill.Common.result.ReconcileSnapshot selectReconcileSnapshot(@Param("stockId") Long stockId);
+
+    /**
+     * 「投递已放弃、订单却仍停在 PENDING」的预订单明细（对账修复用）。
+     * <p>
+     * 判据与 {@link #selectReconcileSnapshot} 里的 {@code abandonedPending} 完全一致，
+     * 只是这里要的是行本身：对账为它们补登记「取消订单 + 归还预扣」待办时需要
+     * {@code orderNo / userId} 这两个还原现场所必需的字段。
+     * <p>
+     * 走 {@code uk_outbox_order_no} 等值连接，一次对账的调用频率（默认 5 分钟）下代价可忽略。
+     */
+    @Select("SELECT o.* FROM orders o JOIN seckill_outbox x ON x.order_no = o.order_no "
+            + "WHERE o.stock_id = #{stockId} AND o.status = 'PENDING' AND x.status = 'FAILED' "
+            + "ORDER BY o.id")
+    List<Order> selectAbandonedPending(@Param("stockId") Long stockId);
 }

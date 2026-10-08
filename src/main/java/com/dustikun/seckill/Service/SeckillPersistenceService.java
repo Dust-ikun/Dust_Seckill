@@ -141,8 +141,11 @@ public class SeckillPersistenceService {
      * 那条链路在请求线程直接投 MQ，因此没有需要持久化的「待投递凭据」。
      * <p>
      * 代价必须说清：关掉 outbox 就自愿接受了「消息无持久化凭据」的窗口，
-     * 并且多出一条失败形态 —— 订单已落成 PENDING、消息却没投出去时，
-     * 它会一直被认为「在途」，直到对账把它报出来。
+     * 并且多出一条对账<b>也照不到</b>的失败形态 —— 订单已落成 PENDING、消息却没投出去时，
+     * 它会一直被认为「在途」：没有 outbox 记录，就没有任何数据库事实能证明「这条单已经被放弃」，
+     * 于是对账的等式两边一起偏，结论仍是「一致」（区别于投递器放弃的那条路径，
+     * 那条有 FAILED 作为凭据，对账会以 ABANDONED_PENDING 报出来）。
+     * 代价就是这条链路自愿付出的，生产路径不应开启它。
      */
     @Transactional(rollbackFor = Exception.class)
     public PersistOutcome createPendingWithoutOutbox(String orderNo, Long userId, Long stockId) {

@@ -76,7 +76,7 @@ seckill:
     enabled: true                 # false 时回退到同步投递 MQ 的行为
     dispatch-interval-ms: 1000    # 投递器轮询间隔，决定「落库 → 进 MQ」的额外延迟
     batch-size: 500               # 单轮投递上限；批量发送后它直接决定投递吞吐（约 batch-size / 秒）
-    max-retry: 15                 # 投递重试上限，用尽则回补 Redis 预扣并标记 FAILED
+    max-retry: 15                 # 投递重试上限；用尽则同一事务里标记 FAILED + 登记「取消订单 + 归还预扣」待办
     first-retry-delay-seconds: 2  # 首次失败后的退避起点，之后指数退避，上限 5 分钟
     purge-interval-ms: 600000     # 归档清理间隔
     retention-hours: 24           # 已投递记录的保留时长

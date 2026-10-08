@@ -32,7 +32,13 @@ public class OutboxMessage {
     public static final String STATUS_PENDING = "PENDING";
     /** 已投递：已拿到 Broker 确认，等待消费端落库 */
     public static final String STATUS_SENT = "SENT";
-    /** 已放弃：重试次数用尽仍无法投递，Redis 预扣已回补，需人工介入 */
+    /**
+     * 已放弃（终态）：重试次数用尽仍无法投递。
+     * <p>
+     * 它与「归还这笔预扣」是同一个事务里落库的两件事（见 {@code OutboxAbandonService}），
+     * 因此本状态一旦出现，就必然有一条可查、可重试的归还待办跟着它 ——
+     * 而不是「改完状态之后靠调用线程顺手回补」。需人工介入的是那些待办本身重试耗尽的记录。
+     */
     public static final String STATUS_FAILED = "FAILED";
 
     private Long id;

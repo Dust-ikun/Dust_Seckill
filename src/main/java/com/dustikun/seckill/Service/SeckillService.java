@@ -30,7 +30,9 @@ import org.springframework.stereotype.Service;
  *  └─ 3. 立即返回「已受理」
  *
  * 后台投递器（独立于请求线程，见 OutboxDispatchTask）
- *  └─ 4. 扫出 PENDING 记录 → 投 MQ → 标记 SENT；失败按指数退避重试，耗尽则回补 Redis
+ *  └─ 4. 扫出 PENDING 记录 → 投 MQ → 标记 SENT；失败按指数退避重试。
+ *        耗尽则同一事务里「标记 FAILED + 登记归还待办」，随后立刻尝试归还
+ *        （归还由待补偿任务保证，进程消失也追得回来，见 OutboxAbandonService）
  *
  * 消费线程（独立于请求线程与投递器）
  * └─ 5. 确认订单并扣库存（同一事务）：以「状态流转的影响行数」为扣减的幂等键；
@@ -177,8 +179,9 @@ public class SeckillService {
      * 投递失败则取消订单 + 归还库存。
      * <p>
      * 【这条链路自愿放弃的东西】没有持久化凭据：进程若在「订单已建、消息未投」之间消失，
-     * 这笔预订单会永久停在 PENDING 被当作在途，只能靠对账的 PENDING 计数发现。
-     * 生产路径不应开启这个开关。
+     * 这笔预订单会永久停在 PENDING 被当作在途。注意这<b>不是</b>对账能报出来的问题：
+     * 没有 outbox 记录就没有「已放弃」这个事实，对账的等式两边一起偏，结论仍是「一致」
+     * （有凭据的投递器放弃路径才会被报成 ABANDONED_PENDING）。生产路径不应开启这个开关。
      */
     private SeckillOrderResponse acceptWithoutOutbox(String orderNo, Long userId, Long stockId,
                                                      boolean preDeducted, SeckillMessageProducer producer) {
@@ -213,8 +216,8 @@ public class SeckillService {
      * <p>
      * 【为什么取消失败不能让它冒出去】一旦它覆盖原始异常，下面的补偿就不会执行，
      * 库存会直接消失且无人知晓。所以取消失败只记日志，继续走补偿 ——
-     * 残留是一条永远停在 PENDING 的订单，由对账的 PENDING 计数发现
-     * （这条链路自愿放弃了 outbox，也就放弃了自动重投的凭据，因此生产路径不应开启它）。
+     * 残留是一条永远停在 PENDING 的订单：它会被算作在途，因此对账也报不出来
+     * （这条链路自愿放弃了 outbox，也就放弃了「证明它已被放弃」的凭据，生产路径不应开启它）。
      */
     private void cancelThenCompensate(String orderNo, Long userId, Long stockId,
                                       boolean preDeducted, Exception cause) {

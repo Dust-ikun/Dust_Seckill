@@ -51,4 +51,23 @@ public interface CompensateTaskMapper {
 
     @Select("SELECT COUNT(*) FROM compensate_task WHERE status = #{status}")
     int countByStatus(@Param("status") String status);
+
+    /**
+     * 某活动「未了结」的归还义务条数：PENDING 或 FAILED，不含 DONE。
+     * <p>
+     * 对账据此判断还能不能直接改写 Redis 库存。走 {@code idx_stock_user} 前缀，只扫该活动的行；
+     * 调用频率是对账间隔（默认 5 分钟），不构成压力。
+     */
+    @Select("SELECT COUNT(*) FROM compensate_task WHERE stock_id = #{stockId} AND status <> 'DONE'")
+    int countUnresolvedByStockId(@Param("stockId") Long stockId);
+
+    /**
+     * 某活动登记过任务的单号集合（含全部状态）。
+     * <p>
+     * {@code order_no} 对 ROLLBACK_ALL 允许为 NULL，因此必须过滤掉，
+     * 否则调用方构造集合时会撞上空值。
+     */
+    @Select("SELECT DISTINCT order_no FROM compensate_task "
+            + "WHERE stock_id = #{stockId} AND order_no IS NOT NULL")
+    List<String> selectOrderNosByStockId(@Param("stockId") Long stockId);
 }

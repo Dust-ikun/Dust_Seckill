@@ -16,6 +16,7 @@ import org.springframework.stereotype.Service;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Set;
 
 /**
  * 待补偿任务的登记与重试。
@@ -75,27 +76,18 @@ public class CompensateTaskService {
     }
 
     /**
-     * 登记一条待补偿任务。
+     * 登记一条待补偿任务（<b>宽松版</b>）。
      * <p>
      * 本方法<b>不抛异常</b>：它总是在「业务已经失败」的 catch 块里被调用，
      * 此时再抛一个异常会把原始错误盖掉，反而更难排查。
+     * <p>
+     * 代价是「登记失败」只能靠日志暴露（这仍是本链路最坏的情况，日志里带全了还原现场所需字段）。
+     * 因此需要<b>原子性</b>的调用方不要用这个版本，改用 {@link #enqueueStrict}。
      */
     public void enqueue(Long stockId, Long userId, String orderNo, long num,
                         CompensateType type, String reason) {
         try {
-            CompensateTask task = new CompensateTask();
-            task.setStockId(stockId);
-            task.setUserId(userId);
-            task.setOrderNo(orderNo);
-            task.setNum((int) num);
-            task.setType(type.name());
-            task.setReason(Strings.truncate(reason, REASON_MAX));
-            task.setNextRetryTime(LocalDateTime.now().plusSeconds(firstRetryDelaySeconds));
-            compensateTaskMapper.insert(task);
-
-            metrics.onCompensateEnqueued();
-            log.warn("[待补偿·登记] id={}, type={}, stockId={}, userId={}, orderNo={}, reason={}",
-                    task.getId(), type, stockId, userId, orderNo, reason);
+            insert(stockId, userId, orderNo, num, type, reason);
         } catch (Exception e) {
             // 登记失败是本链路最坏的情况：库存既没归还，又没留下任何待处理记录，
             // 事后无从追溯。日志必须带全还原现场所需的所有字段。
@@ -103,6 +95,59 @@ public class CompensateTaskService {
                             + "type={}, stockId={}, userId={}, orderNo={}, num={}, reason={}",
                     type, stockId, userId, orderNo, num, reason, e);
         }
+    }
+
+    /**
+     * 登记一条待补偿任务（<b>严格版</b>：写入失败即抛出）。
+     * <p>
+     * 【什么时候必须用它】当「登记这条待办」与另一条数据库写入必须<b>同时成立</b>时。
+     * 目前的唯一调用方是 {@code OutboxAbandonService}：它把 outbox 的 FAILED 与这条待办
+     * 放进同一个事务 —— 成功则两者都成立；失败则两者都不成立，记录退回 PENDING 继续重试。
+     * <p>
+     * 若这里退化成宽松版，插入失败会被吞掉、事务照常提交：库里留下一条 FAILED 记录
+     * 和一笔永远无人归还的预扣 —— 那正是「标记失败之后进程消失」这个窗口的另一种写法。
+     * <p>
+     * 【本方法自身不开事务】它只发一条 INSERT，会加入<b>调用方当前的事务</b>
+     * （与 {@code OutboxService#enqueue} 同一条约定）。
+     *
+     * @return 登记出来的任务（含数据库生成的 id），供调用方立刻尝试执行
+     */
+    public CompensateTask enqueueStrict(Long stockId, Long userId, String orderNo, long num,
+                                        CompensateType type, String reason) {
+        return insert(stockId, userId, orderNo, num, type, reason);
+    }
+
+    /** 两个登记入口共用的落库动作：只负责组装 + 插入 + 计数，异常一律向上抛 */
+    private CompensateTask insert(Long stockId, Long userId, String orderNo, long num,
+                                  CompensateType type, String reason) {
+        CompensateTask task = new CompensateTask();
+        task.setStockId(stockId);
+        task.setUserId(userId);
+        task.setOrderNo(orderNo);
+        task.setNum((int) num);
+        task.setType(type.name());
+        task.setReason(Strings.truncate(reason, REASON_MAX));
+        task.setNextRetryTime(LocalDateTime.now().plusSeconds(firstRetryDelaySeconds));
+        compensateTaskMapper.insert(task);
+
+        metrics.onCompensateEnqueued();
+        log.warn("[待补偿·登记] id={}, type={}, stockId={}, userId={}, orderNo={}, reason={}",
+                task.getId(), type, stockId, userId, orderNo, reason);
+        return task;
+    }
+
+    /**
+     * 立刻尝试执行一条刚登记的任务，<b>不看 {@code next_retry_time}</b>。
+     * <p>
+     * 它是「写前日志 + 立即尝试」里的后半句：任务已经在库里了，所以这次尝试失败
+     * （Redis 没恢复、订单状态还不合适）一点都不影响正确性 —— 定时任务会按退避把它做完。
+     * 有它才保住了「放弃投递当场就归还库存」的时延；没有它，归还最坏要等到
+     * {@code first-retry-delay} 再加一个扫描间隔之后。
+     *
+     * @return true 表示本次已经了结（归还成功，或确认无需归还）
+     */
+    public boolean executeNow(CompensateTask task) {
+        return task != null && retryOne(task);
     }
 
     /**
@@ -251,5 +296,26 @@ public class CompensateTaskService {
     /** 当前仍待处理的条数（从库里查，跨实例可见） */
     public int countPending() {
         return compensateTaskMapper.countByStatus(CompensateTask.STATUS_PENDING);
+    }
+
+    /**
+     * 某活动「未了结」的归还义务条数（PENDING 或 FAILED，不含 DONE）。
+     * <p>
+     * 对账用它决定<b>敢不敢直接改写 Redis 库存</b>：这些任务的动作都是 {@code INCRBY}，
+     * 只要还有一条没走完，对账的「校准」就可能和它把同一件库存归还两次（库存虚增 → 超卖）。
+     * FAILED 也要算进来：它代表一笔已经放弃的归还义务，人工把它改回 PENDING 重跑时同样会 INCRBY。
+     */
+    public int countUnresolvedByStockId(Long stockId) {
+        return compensateTaskMapper.countUnresolvedByStockId(stockId);
+    }
+
+    /**
+     * 某活动已经登记过任务的单号集合（含全部状态）。
+     * <p>
+     * 对账为「已放弃但未了结」的预订单补登记待办时用它去重：已经登记过的单号不再重复登记，
+     * 否则同一笔归还会有两条待办，而它们各自幂等、彼此不幂等 —— 两条都成功就是归还两次。
+     */
+    public Set<String> orderNosWithTask(Long stockId) {
+        return Set.copyOf(compensateTaskMapper.selectOrderNosByStockId(stockId));
     }
 }

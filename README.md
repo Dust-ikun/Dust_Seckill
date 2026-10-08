@@ -30,7 +30,8 @@
 
 后台投递器（@Scheduled，独立于请求线程）
  └─ 4. 扫出 PENDING 凭据 → 批量投 MQ → 标记 SENT；失败指数退避重试，
-         重试耗尽 → 标记 FAILED → 回补 Redis 预扣
+         重试耗尽 → 同一事务里「标记 FAILED + 登记归还待办（CANCEL_ORDER）」
+                  → 立刻尝试执行一次（失败由待补偿任务按退避做完）
 
 消费线程（独立线程池）
  └─ 5. 幂等确认订单 + 条件扣库存（同一事务）：
@@ -44,8 +45,9 @@
 - **Outbox 可靠投递**：消息先落库再投递，Broker 不可用不再等于用户丢单；「已受理未投出」的规模可由 `COUNT(PENDING)` 直接查询，不依赖 JVM 内存计数。
 - **幂等双保险**：`orders.uk_order_no`（单号唯一，MQ 重投吸收）+ `orders.uk_user_stock`（一人一单的数据库兜底，Redis SADD 去重之外的最后防线）。
 - **查单判据以订单状态优先**：CONFIRMED→SUCCESS / PENDING→QUEUED / CANCELLED→FAILED；订单未落库时才退回用 Redis 预扣标记判断（outbox 状态不能反推预扣状态，不参与判定）。
-- **失败处置顺序**：放弃投递时**先写 FAILED、再回补 Redis**——顺序颠倒会出现「库存已还 + 订单又成立」的超卖；先改状态的最坏情况只是少卖，可被对账发现。
-- **对账兜底**：Redis 与数据库的真实状态比对，覆盖补偿逻辑照不到的两条路径（降级写库、Redis 假阴性）。默认只报告不改数据。
+- **失败处置顺序**：放弃投递时**先写 FAILED（与归还待办同一事务）、再由待办归还 Redis**——顺序颠倒会出现「库存已还 + 订单又成立」的超卖；先落库的最坏情况只是少卖，而且进程在归还前消失也追得回来（旧写法把归还放在事务之外的内存调用里，崩在中间就永久少卖且对账也看不出来）。
+- **对账兜底**：Redis 与数据库的真实状态比对，覆盖补偿逻辑照不到的三条路径（降级写库、Redis 假阴性、投递已放弃但订单仍停在 PENDING）。默认只报告不改数据；`repair=true` 时也不会在有悬空归还义务的情况下贸然校准库存。
+- **在途口径**：`可信在途 = PENDING 预订单 − 已放弃但仍为 PENDING 的预订单`。后半部分是关键：它既不会被确认、也不会被取消，算进在途就会给等式两边同时减一，让一笔真正丢失的预扣读成「一致」。
 
 ## 3. 目录结构
 
@@ -57,8 +59,9 @@ src/main/java/com/dustikun/seckill/
 │   ├── SeckillPersistenceService   # orders(PENDING)+outbox 同事务写入
 │   ├── StockCacheService           # Redis 库存缓存 / Lua 脚本调用
 │   ├── OutboxService               # Outbox 登记/投递/退避/放弃/归档
+│   ├── OutboxAbandonService        # 放弃投递的落库点：FAILED + 归还待办同事务
 │   ├── PreDeductCompensator        # 统一的「回滚一次 Redis 预扣」动作（三态结局）
-│   ├── CompensateTaskService       # 待补偿任务重试
+│   ├── CompensateTaskService       # 待补偿任务登记/重试/立即执行
 │   └── StockReconcileService       # 库存对账与修复
 ├── Mq/                  # SeckillMessage / SeckillMessageProducer / SeckillOrderConsumer
 ├── Mapper/              # MyBatis Mapper（含 BenchStockMapper）
@@ -81,8 +84,8 @@ src/main/resources/
 |---|---|
 | `stock` | 库存（`count` 为数据库侧剩余量，Redis 余量以 `seckill:stock:{id}` 为准） |
 | `orders` | 订单。`uk_order_no` / `uk_user_stock` 两个唯一索引兼任幂等键；`idx_orders_stock_status` 支撑按活动统计在途 PENDING |
-| `compensate_task` | 待补偿任务（回补失败时的「动作待办表」，非幂等表；指数退避重试，耗尽标 FAILED 等人工介入） |
-| `seckill_outbox` | 本地消息表（PENDING / SENT / FAILED；`uk_outbox_order_no` 保证一单一凭据；投递器按 `idx_outbox_status_next_retry` 只扫到期段） |
+| `compensate_task` | 待补偿任务（「动作待办表」，非幂等表；`ROLLBACK_ALL` / `RESTORE_STOCK_ONLY` / `CANCEL_ORDER`；指数退避重试，耗尽标 FAILED 等人工介入。FAILED 也算「未了结的归还义务」，对账据此不自动校准库存） |
+| `seckill_outbox` | 本地消息表（PENDING / SENT / FAILED；状态流转只允许 PENDING → {SENT, FAILED}，所有 UPDATE 都带 `status='PENDING'` 守卫；`uk_outbox_order_no` 保证一单一凭据；投递器按 `idx_outbox_status_next_retry` 只扫到期段） |
 
 初始化：`mysql -uroot -p seckill < src/main/resources/db/schema.sql`（内含商品 id=1 的初始化数据，以及老库迁移用的增量 ALTER 注释）。
 
@@ -104,7 +107,7 @@ src/main/resources/
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/seckill/metrics` | 运行态指标：请求侧 / 待投递侧（outbox\_*）/ MQ 投递侧 / 消费侧 / 补偿侧计数 |
-| GET | `/seckill/reconcile?stockId=&expectedInFlight=&repair=` | 库存对账。`expectedInFlight` 默认 `-1` = 自动模式：在途数按「数据库库存 − PENDING 预订单数」从库中直接算出，无需人工判断；传 `>=0` 可显式覆盖。默认只报告；`repair=true` 会把 Redis 校准为「数据库 − 在途」 |
+| GET | `/seckill/reconcile?stockId=&expectedInFlight=&repair=` | 库存对账。`expectedInFlight` 默认 `-1` = 自动模式：在途数按「数据库库存 − 可信在途」从库中直接算出（可信在途 = PENDING 预订单 − 已放弃但仍为 PENDING 的），无需人工判断；传 `>=0` 可显式覆盖。默认只报告；`repair=true` 会（a）为「投递已放弃但订单仍为 PENDING」的记录补登记归还待办、（b）在没有悬空归还义务时把 Redis 校准为「数据库 − 可信在途」、（c）补齐缺失的已购标记 |
 | GET | `/seckill/count` | 已受理下单数 |
 
 ### 压测对照端点（默认关闭）
@@ -165,9 +168,9 @@ mvn test
 测试覆盖（36 项）：
 
 - `SeckillConcurrencyTest` — 并发抢购下的防超卖与一人一单
-- `SeckillOutboxTest` — Outbox 登记 / 退避重试 / 耗尽放弃回补 / MQ 未启用时不动记录 / 归档只清 SENT
+- `SeckillOutboxTest` — Outbox 登记 / 退避重试 / 耗尽放弃（FAILED 与归还待办同事务、待办插不进则两者都不成立）/ MQ 未启用时不动记录 / 归档只清 SENT
 - `SeckillCompensationTest` — 补偿路径与查单终态
-- `SeckillReviewFixTest` — 评审修复项回归
+- `SeckillReviewFixTest` — 评审修复项回归（含「投递已放弃但仍为 PENDING」必须被对账报出来且不许对账自己改库存）
 - `SeckillEntityMappingTest` — snake_case 列映射回归锁（防 `map-underscore-to-camel-case` 配置失效导致静默 null）
 - `SeckillOrderStatusTest` — 订单状态机流转
 
@@ -183,8 +186,12 @@ mvn test
    - Gauge（`outbox.pending` / `outbox.failed` / `compensate.pending`）走本地缓存 + 30s 定时刷新，
      最多滞后一个刷新周期——对「欠账规模」这类慢变量够用，但不适合做秒级告警；
    - `/seckill/metrics` 里的 `inFlightEstimate` 仍是**单实例**视角的估算（`mqSent - resolved`）。
-     对账不受影响：它用的在途数是数据库事实 `COUNT(orders WHERE status='PENDING')`。
-5. **多实例重复投递**：不做抢占（SKIP LOCKED / claim），重复投递由消费端 `uk_order_no` 幂等吸收，换来零并发控制复杂度；如需消除只需替换 `OutboxMessageMapper.selectPending` 一处。
+     对账不受影响：它用的在途数是数据库事实 `COUNT(orders WHERE status='PENDING')`
+     再减去「已放弃但仍为 PENDING」的那部分（后者会被单独报成 `ABANDONED_PENDING`）。
+5. **放弃投递后的归还依赖待补偿任务**：`FAILED` 与归还待办同事务落库，正常链路上不会漏；
+   但待办自身重试耗尽会标成 `FAILED`，那部分需要人工介入（对账会把它算作「未了结的归还义务」，
+   因此不会贸然校准库存，但也不会替人做决定）。
+6. **多实例重复投递**：不做抢占（SKIP LOCKED / claim），重复投递由消费端 `uk_order_no` 幂等吸收，换来零并发控制复杂度；如需消除只需替换 `OutboxMessageMapper.selectPending` 一处。
 
 后续方向：对账结果落库 + 告警、活动起止时间自动化、消费完成回写 outbox（全链路台账 +
 让 `pipelineDrained` 跨实例准确）、评估 Redis Stream 版激进方案。

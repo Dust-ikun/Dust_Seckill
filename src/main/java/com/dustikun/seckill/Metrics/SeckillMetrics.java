@@ -141,7 +141,7 @@ public class SeckillMetrics {
                 .description("outbox 投递失败进入退避重试的条数")
                 .register(registry);
         this.outboxAbandoned = Counter.builder("seckill.outbox.abandoned")
-                .description("outbox 重试耗尽、已回补预扣并放弃的条数（需人工过问）")
+                .description("outbox 重试耗尽、已放弃并登记归还待办的条数（需人工过问）")
                 .register(registry);
         this.outboxPurged = Counter.builder("seckill.outbox.purged")
                 .description("归档清理掉的已投递历史记录数")

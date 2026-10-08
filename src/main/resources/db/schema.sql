@@ -69,22 +69,30 @@ CREATE TABLE IF NOT EXISTS `orders`
 --   没人盯日志的时候库存就永久消失（少卖），事后也查不出丢了哪几笔。
 --   落成一张表之后它才有了状态：可被定时任务反复重试、可查询、可人工处理。
 --
---   type = ROLLBACK_ALL       : 库存 +1 且摘掉用户已购标记（这次下单根本不该成立）
---   type = RESTORE_STOCK_ONLY : 库存 +1、保留标记（用户其实已经买过，这次预扣多余）
+--   type = ROLLBACK_ALL       : 库存 +1 且摘掉用户已购标记（这次下单根本不该成立；
+--                               仅在 orders 里【没有】本次尝试的订单行时使用 —— 摘标记与
+--                               「该用户有一行订单」是同一件事的两种表述，不能各说各话）
+--   type = RESTORE_STOCK_ONLY : 库存 +1、保留标记（用户其实已经买过，或订单已取消，这次预扣多余）
+--   type = CANCEL_ORDER       : 先把订单 PENDING → CANCELLED，确认之后才库存 +1、保留标记
+--                               （消费端重试耗尽取消失败、以及投递端重试耗尽时登记）
 --
---   order_no 对 RESTORE_STOCK_ONLY 是**必须**的：该类型的幂等靠「活动 + 单号」构造的
---   一次性去重键，重试时若换了标识就会绕过幂等保护，把库存补两次（→ 超卖）。
+--   order_no 对 RESTORE_STOCK_ONLY 与 CANCEL_ORDER 都是**必须**的：这两个类型的幂等靠
+--   「活动 + 单号」构造的一次性去重键，重试时若换了标识就会绕过幂等保护，把库存补两次（→ 超卖）。
+--
+--   status = FAILED 的行也是「未了结的归还义务」：对账据此判断还能不能直接校准 Redis 库存，
+--   因为那些任务随时可能被人工改回 PENDING 再跑一次（同样会 INCRBY）。
 --
 --   idx_status_next_retry 让定时任务只扫描「到期待处理」的一段，不会随表增长退化成全表扫描。
+--   idx_stock_user 供对账按活动查「还有没有未了结的归还义务」与已登记的单号集合。
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `compensate_task`
 (
     `id`              BIGINT      NOT NULL AUTO_INCREMENT,
     `stock_id`        BIGINT      NOT NULL,
     `user_id`         BIGINT      NOT NULL,
-    `order_no`        VARCHAR(64)          DEFAULT NULL COMMENT '业务单号，RESTORE_STOCK_ONLY 必经',
+    `order_no`        VARCHAR(64)          DEFAULT NULL COMMENT '业务单号，RESTORE_STOCK_ONLY/CANCEL_ORDER 必经',
     `num`             INT         NOT NULL COMMENT '需要归还的数量',
-    `type`            VARCHAR(32) NOT NULL COMMENT 'ROLLBACK_ALL / RESTORE_STOCK_ONLY',
+    `type`            VARCHAR(32) NOT NULL COMMENT 'ROLLBACK_ALL / RESTORE_STOCK_ONLY / CANCEL_ORDER',
     `reason`          VARCHAR(255)         DEFAULT NULL COMMENT '登记原因',
     `status`          VARCHAR(16) NOT NULL DEFAULT 'PENDING' COMMENT 'PENDING / DONE / FAILED',
     `retry_count`     INT         NOT NULL DEFAULT 0,
@@ -108,7 +116,17 @@ CREATE TABLE IF NOT EXISTS `compensate_task`
 --
 --   status = PENDING : 待投递（后台投递器会扫这一批）
 --   status = SENT    : 已拿到 Broker 确认，等消费端落库
---   status = FAILED  : 重试次数用尽仍投不出去，Redis 预扣已回补，需人工介入
+--   status = FAILED  : 重试次数用尽仍投不出去（终态）。它与「归还这笔预扣」的
+--                      compensate_task(CANCEL_ORDER) 在同一个事务里落库，
+--                      因此 FAILED 一定伴随一条可查、可重试的归还待办，而不是只留一句日志。
+--                      两个状态写在一起是刻意的：先改状态、再在内存里顺手回补，
+--                      中间进程消失就会留下「已放弃、无人归还、且对账也看不出来」的记录
+--                      （订单仍是 PENDING，被算作在途，等式两边一起偏）。
+--
+--   状态流转只有 PENDING → {SENT, FAILED} 两条出路，所有 UPDATE 都带 status='PENDING' 守卫：
+--   投递器不做抢占，同一行可能被多实例同时捞起来，无条件赋值会让 SENT 与 FAILED 互相覆盖
+--   （把已投出的消息改回 FAILED 会对它回补，把已放弃的记录改回 SENT 会在库存已归还的前提下
+--    再消费一次），两个方向的代价都不对称地大。
 --
 --   uk_outbox_order_no 保证同一单号只有一条待投递记录：
 --   投递器没有被设计成「只投一次」，它可能因重复轮询而重投同一条记录，

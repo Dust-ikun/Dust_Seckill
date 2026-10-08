@@ -69,6 +69,9 @@ public class MaintenanceTask {
      * <p>
      * 幂等由回补脚本本身保证（rollback 靠 SREM 返回值、restoreStockOnly 靠 SET NX），
      * 所以这里可以放心地「至少重试一次」，不会把库存补多。
+     * <p>
+     * 它还承担「放弃投递之后把预扣还回去」这件事：{@code OutboxAbandonService} 只在放弃的瞬间
+     * 立刻尝试一次，成功与否都不影响正确性 —— 真正的保证在这里，独立于投递器线程的存活。
      */
     @Scheduled(fixedDelayString = "${seckill.maintenance.compensate.interval-ms:30000}")
     public void retryCompensateTasks() {
@@ -87,12 +90,17 @@ public class MaintenanceTask {
     /**
      * 库存对账。
      * <p>
-     * 在途数走<b>自动模式</b>（按「数据库库存 − PENDING 预订单数」计算，多实例也准确），
-     * 不再依赖排空后传 0：即使仍有在途，期望值也已把在途算进去，正常中间态不会被误报。
+     * 在途数走<b>自动模式</b>（按「数据库库存 − 可信在途」计算，可信在途 = PENDING 预订单
+     * 减去「投递已放弃但仍停在 PENDING」的那些，多实例也准确），不再依赖排空后传 0：
+     * 即使仍有在途，期望值也已把在途算进去，正常中间态不会被误报。
      * <p>
      * 排空门控仍然保留，但它防的对象变了——现在防的是<b>读偏斜</b>：
      * 数据库快照与 Redis 读数之间的窗口里若恰好有一笔请求「已扣 Redis、还没插入 PENDING」，
      * 会把正常中间态读成 REDIS_BEHIND(1)。排空后再对账，这个窗口自然关上。
+     * <p>
+     * 【注意门控放行 ≠ 一切正常】门控只数 outbox 的 PENDING，FAILED 是终态、不计数，
+     * 所以「已放弃但订单还挂在 PENDING」的记录不会让门控关上。它由对账自身的
+     * {@code ABANDONED_PENDING} 结论负责报出来（默认只告警，repair=true 时才补登记归还待办）。
      */
     @Scheduled(fixedDelayString = "${seckill.maintenance.reconcile.interval-ms:300000}")
     public void reconcileStocks() {
