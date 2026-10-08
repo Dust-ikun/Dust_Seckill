@@ -32,6 +32,15 @@ public class ReconcileSnapshot {
      */
     private long abandonedPending;
 
+    /**
+     * 其中「超过陈旧阈值仍是 PENDING」的条数（<b>不含</b>上面那些已放弃的）。
+     * <p>
+     * 它表示「消息投出去了却没人消费」（消费者组挂掉、消息在 Broker 侧丢失）或「根本没有凭据」
+     * （outbox 关闭链路上「订单已建、消息未投」就崩了）—— 见
+     * {@code ReconcileReport.Status#STALE_PENDING}。与 {@code abandonedPending} 互斥，可直接相加。
+     */
+    private long stalePending;
+
     /** 该活动的订单总数（含全部状态），用于 MARK_MISSING 判定与报告展示 */
     private long dbOrderCount;
 }

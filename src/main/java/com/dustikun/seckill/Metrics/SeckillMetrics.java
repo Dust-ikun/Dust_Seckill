@@ -1,10 +1,14 @@
 package com.dustikun.seckill.Metrics;
 
+import com.dustikun.seckill.Common.result.ReconcileReport;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.stereotype.Component;
 
+import java.util.EnumMap;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -112,6 +116,18 @@ public class SeckillMetrics {
     /** 待补偿任务未结案数 */
     private final AtomicLong compensatePending = new AtomicLong();
 
+    // ================================================================ 对账侧
+
+    /**
+     * 对账结论计数，<b>按结论分标签</b>（只统计非 CONSISTENT 的那些）。
+     * <p>
+     * 为什么对账也需要指标：它此前的唯一出口是日志，而「日志会滚、指标不会」——
+     * 一条 {@code ABANDONED_PENDING} 藏在几万行日志里没人看得见，但
+     * {@code rate(seckill_reconcile_findings_total{status="STALE_PENDING"}[5m]) > 0}
+     * 可以直接写成告警规则。这也是 README「已知取舍」里「对账结果只写日志」的第一步收口。
+     */
+    private final Map<ReconcileReport.Status, Counter> reconcileFindings;
+
     public SeckillMetrics(MeterRegistry registry) {
         // ---------------- 请求侧 ----------------
         this.queued = Counter.builder("seckill.request.queued")
@@ -185,6 +201,17 @@ public class SeckillMetrics {
         this.compensateAbandoned = Counter.builder("seckill.compensate.abandoned")
                 .description("待补偿任务重试耗尽、标记 FAILED 的条数（需人工介入）")
                 .register(registry);
+
+        // ---------------- 对账侧 ----------------
+        // 每个结论一枚计数器（带 status 标签）。枚举是封闭集合，因此一次性把所有系列注册出来，
+        // 免得「第一次出现某个结论」时才创建仪表——那会让告警规则在首个样本到来前查不到序列。
+        this.reconcileFindings = new EnumMap<>(ReconcileReport.Status.class);
+        for (ReconcileReport.Status status : ReconcileReport.Status.values()) {
+            reconcileFindings.put(status, Counter.builder("seckill.reconcile.findings")
+                    .description("对账得出的结论次数（按 status 分标签；CONSISTENT 不计数）")
+                    .tag("status", status.name())
+                    .register(registry));
+        }
 
         // ---------------- 数据库事实 ----------------
         Gauge.builder("seckill.outbox.pending", outboxPending, AtomicLong::doubleValue)
@@ -295,6 +322,16 @@ public class SeckillMetrics {
 
     public void onCompensateAbandoned() {
         compensateAbandoned.increment();
+    }
+
+    // ================================================================ 对账侧
+
+    /**
+     * 记录一次对账结论。只在结论<b>不是</b> CONSISTENT 时调用 ——
+     * 对账正常不该产生时间序列上的噪音，而「发现不一致」才需要被 rate() 看见。
+     */
+    public void onReconcileFinding(ReconcileReport.Status status) {
+        reconcileFindings.get(status).increment();
     }
 
     // ================================================================ Gauge 刷新
@@ -418,11 +455,23 @@ public class SeckillMetrics {
      * 已处理完的消息数：确认成功 / 重复投递 / 订单缺失 / 重试耗尽后已 ACK。
      * <p>
      * 与投递侧相减即可估算「在途消息数」。注意这是<b>单实例</b>视角的估算，
-     * 多实例下只是粗略提示；对账使用的「在途预扣数」用的是数据库事实
-     * {@code COUNT(orders WHERE status='PENDING')}，不依赖本方法。
+     * 多实例下只是粗略提示；对账使用的「可信在途」用的是数据库事实
+     * （{@code COUNT(orders WHERE status='PENDING')} 减去两类未了结的预订单），不依赖本方法。
      */
     public long resolvedCount() {
         return (long) (consumeConfirmed.count() + consumeDuplicate.count()
                 + consumeOrderMissing.count() + consumeFailed.count());
+    }
+
+    /**
+     * 各结论的对账次数（按枚举顺序），给 {@code /seckill/metrics} 的人读视图用。
+     * <p>
+     * 读的是注册表里的同一批 Counter，因此与 Prometheus 出口不可能给出不同的数字 ——
+     * 这是「一份真相，两个出口」在这条链路上的具体含义。
+     */
+    public Map<String, Long> reconcileFindingCounts() {
+        Map<String, Long> counts = new LinkedHashMap<>();
+        reconcileFindings.forEach((status, counter) -> counts.put(status.name(), (long) counter.count()));
+        return counts;
     }
 }

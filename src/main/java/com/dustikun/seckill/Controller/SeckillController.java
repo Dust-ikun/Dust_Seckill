@@ -245,6 +245,10 @@ public class SeckillController {
         view.put("compensateAbandoned", metrics.compensateAbandonedCount());
         view.put("compensatePending", metrics.compensatePendingGauge());
 
+        // ---- 对账侧：按结论分标签的计数（只统计非 CONSISTENT）----
+        // 对账此前只有日志出口，而日志会滚。这里与 Prometheus 读的是同一批 Counter。
+        view.put("reconcileFindings", metrics.reconcileFindingCounts());
+
         return Result.success("运行指标", view);
     }
 }

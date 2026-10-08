@@ -67,6 +67,7 @@ seckill:
     reconcile:
       interval-ms: 300000         # 对账间隔（5 分钟）
       auto-repair: false          # 默认只告警不改数据
+      stale-pending-minutes: 90   # 「陈旧未了结」阈值；须大于最坏链路时延（投递退避 ≈19 分钟 + 消费重试）
       stock-ids: 1                # 纳入自动对账的活动 ID（逗号分隔），留空则只支持手动对账
 
   # ---------------- 本地消息表（Outbox） ----------------

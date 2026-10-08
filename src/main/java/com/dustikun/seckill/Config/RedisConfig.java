@@ -38,6 +38,18 @@ public class RedisConfig {
         return loadScript("lua/seckill_restore_stock.lua");
     }
 
+    /**
+     * 对账校准脚本：带值比对（乐观锁）的库存改写。
+     * <p>
+     * 它取代了原先「对账直接把 Redis SET 成应有值」的写法：读与写之间若有请求完成预扣，
+     * 那次 SET 会把预扣抹掉（Redis 多出一件可售），而订单已经落库 —— 用户随后会看到
+     * 「抢到了却下单失败」。值比对让这种情况变成「本轮不修」，下一轮基于新值重新判定。
+     */
+    @Bean("seckillSyncStockScript")
+    public RedisScript<Long> seckillSyncStockScript() {
+        return loadScript("lua/seckill_sync_stock.lua");
+    }
+
     private RedisScript<Long> loadScript(String classpathLocation) {
         DefaultRedisScript<Long> script = new DefaultRedisScript<>();
         script.setScriptSource(new ResourceScriptSource(new ClassPathResource(classpathLocation)));

@@ -4,6 +4,10 @@
 
 核心设计原则：**宁可少卖，绝不超卖**——所有失败路径的处置顺序、补偿与回补策略均按此裁决。
 
+> **接手项目先读 [`docs/秒杀链路文档.md`](docs/秒杀链路文档.md)**：把「一次下单经过哪些环节、每个环节失败会怎样、
+> 漏掉的东西谁负责发现」讲清楚，含失败/补偿矩阵、崩溃点清单、对账判据、运维手册与常用排查 SQL。
+> 本 README 只做概览与速查，链路细节以那份文档为准。
+
 ---
 
 ## 1. 技术栈
@@ -73,9 +77,12 @@ src/main/java/com/dustikun/seckill/
 └── Bench/               # 压测对照端点（cond vs opt，默认关闭）
 
 src/main/resources/
-├── lua/                 # seckill_deduct / seckill_rollback / seckill_restore_stock
+├── lua/                 # seckill_deduct / seckill_rollback / seckill_restore_stock / seckill_sync_stock
 ├── db/schema.sql        # 建库建表脚本（含增量 ALTER 说明）
 └── application.yaml     # 主配置（application-example.yaml 为脱敏示例）
+
+docs/
+└── 秒杀链路文档.md       # 链路 / 状态机 / 失败补偿矩阵 / 崩溃点 / 对账判据 / 运维手册（接手先读）
 ```
 
 ## 4. 数据库表
@@ -107,7 +114,7 @@ src/main/resources/
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/seckill/metrics` | 运行态指标：请求侧 / 待投递侧（outbox\_*）/ MQ 投递侧 / 消费侧 / 补偿侧计数 |
-| GET | `/seckill/reconcile?stockId=&expectedInFlight=&repair=` | 库存对账。`expectedInFlight` 默认 `-1` = 自动模式：在途数按「数据库库存 − 可信在途」从库中直接算出（可信在途 = PENDING 预订单 − 已放弃但仍为 PENDING 的），无需人工判断；传 `>=0` 可显式覆盖。默认只报告；`repair=true` 会（a）为「投递已放弃但订单仍为 PENDING」的记录补登记归还待办、（b）在没有悬空归还义务时把 Redis 校准为「数据库 − 可信在途」、（c）补齐缺失的已购标记 |
+| GET | `/seckill/reconcile?stockId=&expectedInFlight=&repair=` | 库存对账。`expectedInFlight` 默认 `-1` = 自动模式：在途数按「数据库库存 − 可信在途」从库中直接算出（可信在途 = PENDING 预订单 − 已放弃未了结 − 陈旧未了结），无需人工判断；传 `>=0` 可显式覆盖。默认只报告；`repair=true` 会（a）为「已放弃 / 陈旧未了结」的预订单补登记归还待办、（b）在没有未了结归还义务且写入前值比对通过时，把 Redis 校准为「数据库 − 可信在途」、（c）补齐缺失的已购标记 |
 | GET | `/seckill/count` | 已受理下单数 |
 
 ### 压测对照端点（默认关闭）
@@ -120,7 +127,7 @@ src/main/resources/
 |---|---|---|
 | `mq` | `enabled` / `name-server` / `topic` / `tag` / `send-timeout-ms` / `max-reconsume-times` / `consume-thread-min/max` | 置 `false` 时不创建任何 MQ 客户端，链路退化为「Redis 预扣 + 同步落库」，便于本机无 Broker 时调试。消费线程数不要超过 Hikari `maximum-pool-size` |
 | `outbox` | `enabled`（默认 true）/ `dispatch-interval-ms=1000` / `batch-size=500` / `max-retry=15` / `first-retry-delay-seconds=2` / `purge-interval-ms=600000` / `retention-hours=24` / `purge-batch-size=1000` | 置 `false` 回到同步投递行为。投递为「先批量、失败退回逐条」；重试指数退避、封顶 5 分钟；归档只清超期 SENT，按批删除 |
-| `maintenance` | `enabled` / `compensate.*` / `reconcile.*` | 待补偿任务轮询与库存对账两个定时任务。对账默认 `auto-repair=false`（只检测告警） |
+| `maintenance` | `enabled` / `compensate.*` / `reconcile.*`（含 `stale-pending-minutes=90`） | 待补偿任务轮询与库存对账两个定时任务。对账默认 `auto-repair=false`（只检测告警 + 指标计数）；`stale-pending-minutes` 是「陈旧未了结」的判定阈值，同时决定排空门控的封顶时长，必须大于最坏链路时延（默认配置下投递退避 ≈19 分钟） |
 | `worker-id` | `0` | Snowflake 机器位（0~1023），多实例部署必须各不相同，否则单号重复 |
 
 注意：`seckill.maintenance.enabled=false` 不会连带关掉投递器——`@EnableScheduling` 无条件开启，各任务用自己的 `@ConditionalOnProperty` 独立注册。
@@ -178,20 +185,22 @@ mvn test
 
 如实记录的固有取舍（均有对账兜底）：
 
-1. **INSERT 之前仍有窗口**：进程在「Redis 已扣、预订单未写」之间消失，该预扣无持久化记录。窗口已缩至一次本地事务提交，彻底消除需预扣本身可恢复，属另一层取舍。
-2. **对账结果未落库**：发现不一致只写日志，历史不可回溯。
+1. **INSERT 之前仍有窗口**：进程在「Redis 已扣、预订单未写」之间消失，该预扣无持久化记录，且对账也报不出来（崩溃前后它读到的输入完全一致）。窗口已缩至一次本地事务提交，彻底消除需预扣本身可恢复，属另一层取舍。
+2. **对账结果不落库**：发现不一致会写 ERROR 日志 + 按结论分标签的计数器（`seckill_reconcile_findings_total`），但没有历史报告表，回溯要靠日志系统。
 3. **消费完成不回写 outbox**：「已投出未消费」只能靠单实例进程内计数判断
-   （`MaintenanceTask#pipelineDrained` 用 `mqSentCount() - resolvedCount()` 估算）。
+   （`MaintenanceTask#pipelineDrained` 用 `mqSentCount() - resolvedCount()` 估算）；
+   该门控已被「陈旧阈值」封顶，因此卡死的链路不会被它永久挡住。
 4. **指标的两个残余局限**（已迁 Micrometer，这两条是迁移后剩下的）：
    - Gauge（`outbox.pending` / `outbox.failed` / `compensate.pending`）走本地缓存 + 30s 定时刷新，
      最多滞后一个刷新周期——对「欠账规模」这类慢变量够用，但不适合做秒级告警；
    - `/seckill/metrics` 里的 `inFlightEstimate` 仍是**单实例**视角的估算（`mqSent - resolved`）。
-     对账不受影响：它用的在途数是数据库事实 `COUNT(orders WHERE status='PENDING')`
-     再减去「已放弃但仍为 PENDING」的那部分（后者会被单独报成 `ABANDONED_PENDING`）。
+     对账不受影响：它用的可信在途是数据库事实（`PENDING` 减去「已放弃」「陈旧未了结」两类）。
 5. **放弃投递后的归还依赖待补偿任务**：`FAILED` 与归还待办同事务落库，正常链路上不会漏；
    但待办自身重试耗尽会标成 `FAILED`，那部分需要人工介入（对账会把它算作「未了结的归还义务」，
    因此不会贸然校准库存，但也不会替人做决定）。
 6. **多实例重复投递**：不做抢占（SKIP LOCKED / claim），重复投递由消费端 `uk_order_no` 幂等吸收，换来零并发控制复杂度；如需消除只需替换 `OutboxMessageMapper.selectPending` 一处。
+7. **陈旧判定本质是时间推断**：阈值再保守也可能误判（例如大促期间消费积压超过阈值），因此它默认只告警；
+   要自动补登记归还待办必须显式打开 `auto-repair`。
 
 后续方向：对账结果落库 + 告警、活动起止时间自动化、消费完成回写 outbox（全链路台账 +
 让 `pipelineDrained` 跨实例准确）、评估 Redis Stream 版激进方案。

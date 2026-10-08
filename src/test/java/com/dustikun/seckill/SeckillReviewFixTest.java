@@ -7,6 +7,7 @@ import com.dustikun.seckill.Common.result.RollbackResult;
 import com.dustikun.seckill.Mapper.CompensateTaskMapper;
 import com.dustikun.seckill.Mapper.OrderMapper;
 import com.dustikun.seckill.Mapper.OutboxMessageMapper;
+import com.dustikun.seckill.Metrics.SeckillMetrics;
 import com.dustikun.seckill.Service.CompensateTaskService;
 import com.dustikun.seckill.Service.SeckillPersistenceService;
 import com.dustikun.seckill.Service.SeckillPersistenceService.PersistOutcome;
@@ -60,6 +61,8 @@ class SeckillReviewFixTest {
     private CompensateTaskMapper compensateTaskMapper;
     @Autowired
     private OutboxMessageMapper outboxMapper;
+    @Autowired
+    private SeckillMetrics metrics;
     @Autowired
     private StringRedisTemplate redisTemplate;
     @Autowired
@@ -410,6 +413,133 @@ class SeckillReviewFixTest {
         compensateTaskService.retryDue(100);
         assertEquals(INIT_STOCK, stockCacheService.remain(STOCK_ID),
                 "重复归还就是库存虚增（超卖方向），去重键必须先于 INCRBY 生效");
+    }
+
+    // ================================================================ 残留改进：CAS 校准 / 门控 / 陈旧检测
+
+    @Test
+    @DisplayName("残留改进：对账校准带值比对，值不一致时绝不覆盖（防把并发预扣抹掉）")
+    void calibrationShouldBeCompareAndSet() {
+        stockCacheService.preheat(STOCK_ID);
+        redisTemplate.opsForValue().set(SeckillRedisKeys.stock(STOCK_ID), "99");
+
+        // 值没变 → 允许写入
+        assertTrue(stockCacheService.syncStockIfUnchanged(STOCK_ID, 99, 100),
+                "读到的值与当前值一致时，校准应当生效");
+        assertEquals(100, stockCacheService.remain(STOCK_ID));
+
+        // 值变了（模拟：读之后有请求完成了一次预扣）→ 放弃写入
+        redisTemplate.opsForValue().set(SeckillRedisKeys.stock(STOCK_ID), "98");
+        assertFalse(stockCacheService.syncStockIfUnchanged(STOCK_ID, 99, 100),
+                "值已被改动时必须放弃校准：覆盖就等于把那笔预扣抹掉（Redis 多出一件可售）");
+        assertEquals(98, stockCacheService.remain(STOCK_ID),
+                "放弃校准 = 一个字节都不改；下一轮对账会基于新值重新判定");
+
+        // 活动已清理 → 同样不动手
+        stockCacheService.clear(STOCK_ID);
+        assertFalse(stockCacheService.syncStockIfUnchanged(STOCK_ID, 98, 100),
+                "库存 key 不存在时应明确返回「未校准」，而不是造出一个 key");
+        assertNull(stockCacheService.remain(STOCK_ID));
+    }
+
+    @Test
+    @DisplayName("残留改进：值比对不通过时对账只报告不改库存（写清为什么没动手）")
+    void reconcileShouldSkipCalibrationWhenValueChanged() {
+        stockCacheService.preheat(STOCK_ID);                 // Redis = 100, DB = 100
+        // 让值比对必然失败：库内值写成非规范十进制的 "0100"（读取得到整数 100）——
+        // 比较是字符串比较，因此等价于「读之后值被改动」，无需竞态注入就能确定复现该分支。
+        redisTemplate.opsForValue().set(SeckillRedisKeys.stock(STOCK_ID), "0100");
+        jdbcTemplate.update("UPDATE stock SET count = count - 1 WHERE id = ?", STOCK_ID);   // 制造 REDIS_AHEAD
+
+        ReconcileReport report = stockReconcileService.reconcile(STOCK_ID, 0L, true);
+
+        assertEquals(ReconcileReport.Status.REDIS_AHEAD, report.status());
+        assertFalse(report.repaired(), "值比对不通过时不得改写库存");
+        assertEquals("0100", redisTemplate.opsForValue().get(SeckillRedisKeys.stock(STOCK_ID)),
+                "Redis 侧必须一个字节都没变");
+        assertTrue(report.actions().stream().anyMatch(action -> action.contains("值比对未通过")),
+                "报告里必须写清「为什么这轮没修」，否则运维只会看到一条没有下文的告警");
+    }
+
+    @Test
+    @DisplayName("残留改进：还有未了结的归还义务时，对账不校准库存（否则与待办重复归还同一件）")
+    void reconcileShouldSkipCalibrationWhileReleaseTaskOutstanding() {
+        stockCacheService.preheat(STOCK_ID);                 // Redis = 100
+        jdbcTemplate.update("UPDATE stock SET count = count - 1 WHERE id = ?", STOCK_ID);  // 制造 REDIS_AHEAD
+
+        // 造一条未了结的归还义务（真实场景：上一次回补撞上 Redis 故障，任务还在重试）
+        compensateTaskService.enqueue(STOCK_ID, 800022L, null, 1,
+                CompensateType.ROLLBACK_ALL, "单测构造：未了结的归还义务");
+
+        ReconcileReport report = stockReconcileService.reconcile(STOCK_ID, 0L, true);
+
+        assertEquals(ReconcileReport.Status.REDIS_AHEAD, report.status());
+        assertEquals(1, report.unresolvedCompensations(), "报告必须暴露未了结的归还义务条数");
+        assertFalse(report.repaired(), "归还义务未了结时不得校准库存");
+        assertEquals(INIT_STOCK, stockCacheService.remain(STOCK_ID), "库存必须保持不动");
+        assertTrue(report.actions().stream().anyMatch(action -> action.contains("库存校准已跳过")),
+                "跳过原因必须留在报告里：否则「repair=true 却没修」看起来像坏了");
+    }
+
+    @Test
+    @DisplayName("残留改进：消息投出去却没人消费（陈旧未了结）必须被报出来，并可补登记归还待办")
+    void reconcileShouldDetectStalePendingOrders() {
+        stockCacheService.preheat(STOCK_ID);
+        long userId = 800023L;
+        String orderNo = "RVT-STALE-" + System.nanoTime();
+
+        // 构造「投递成功但没人消费」：Redis 已预扣、订单 PENDING、没有任何 FAILED 凭据，
+        // 只是时间已经久到不可能再有正当理由（消费者组挂掉 / 消息丢失）。
+        stockCacheService.tryDeduct(STOCK_ID, userId, 1);    // Redis = 99
+        insertPendingOrder(orderNo, userId);
+        jdbcTemplate.update("UPDATE orders SET create_time = DATE_SUB(NOW(), INTERVAL 200 MINUTE) "
+                + "WHERE order_no = ?", orderNo);
+
+        assertTrue(stockReconcileService.pipelineStuck(STOCK_ID),
+                "最老的预订单已超过陈旧阈值 → 门控必须放行，否则对账会被永久挡住");
+
+        ReconcileReport detected = stockReconcileService.reconcile(STOCK_ID, false);
+        assertEquals(ReconcileReport.Status.STALE_PENDING, detected.status(),
+                "陈旧未了结的预订单会污染在途口径，必须单独报出来");
+        assertEquals(1, detected.stalePending());
+        assertEquals(0, detected.expectedInFlight(), "陈旧未了结的预订单不算可信在途");
+        assertEquals(0L, detected.abandonedPending(), "两类计数互斥，不能重复计数");
+        assertTrue(metrics.reconcileFindingCounts().get("STALE_PENDING") >= 1,
+                "对账结论要落进指标（日志会滚，指标不会）");
+
+        // repair=true：补登记「取消订单 + 归还预扣」待办，但不动库存
+        ReconcileReport repaired = stockReconcileService.reconcile(STOCK_ID, true);
+        assertTrue(repaired.repaired(), "应为陈旧预订单补登记归还待办");
+        assertEquals(INIT_STOCK - 1, stockCacheService.remain(STOCK_ID), "登记待办这一步不改库存");
+
+        makeDue();
+        compensateTaskService.retryDue(100);
+
+        assertEquals(Order.STATUS_CANCELLED, orderMapper.selectByOrderNo(orderNo).getStatus(),
+                "归还之前先取消订单：否则它永远停在处理中，查单永远是 QUEUED");
+        assertEquals(INIT_STOCK, stockCacheService.remain(STOCK_ID), "预扣应被归还");
+        assertEquals(ReconcileReport.Status.CONSISTENT,
+                stockReconcileService.reconcile(STOCK_ID, false).status(),
+                "了结之后应当一致");
+        assertFalse(stockReconcileService.pipelineStuck(STOCK_ID),
+                "没有 PENDING 预订单时链路不算卡住");
+    }
+
+    @Test
+    @DisplayName("残留改进：还在正常处理时长内的 PENDING 不得被判成陈旧（阈值必须放得住活单）")
+    void freshPendingShouldNotBeTreatedAsStale() {
+        stockCacheService.preheat(STOCK_ID);
+        long userId = 800024L;
+
+        stockCacheService.tryDeduct(STOCK_ID, userId, 1);
+        insertPendingOrder("RVT-FRESH-" + System.nanoTime(), userId);
+
+        ReconcileReport report = stockReconcileService.reconcile(STOCK_ID, false);
+        assertEquals(ReconcileReport.Status.CONSISTENT, report.status(),
+                "刚受理的中间态是正常的：在途口径必须仍然认它");
+        assertEquals(0, report.stalePending());
+        assertEquals(1, report.expectedInFlight());
+        assertFalse(stockReconcileService.pipelineStuck(STOCK_ID), "新单不算卡住");
     }
 
     // ================================================================ 评审问题 5 / 7

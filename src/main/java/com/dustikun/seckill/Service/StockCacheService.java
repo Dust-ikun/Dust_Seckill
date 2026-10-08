@@ -72,17 +72,20 @@ public class StockCacheService {
     private final RedisScript<Long> deductScript;
     private final RedisScript<Long> rollbackScript;
     private final RedisScript<Long> restoreStockScript;
+    private final RedisScript<Long> syncStockScript;
     private final StockMapper stockMapper;
 
     public StockCacheService(StringRedisTemplate redisTemplate,
                              @Qualifier("seckillDeductScript") RedisScript<Long> deductScript,
                              @Qualifier("seckillRollbackScript") RedisScript<Long> rollbackScript,
                              @Qualifier("seckillRestoreStockScript") RedisScript<Long> restoreStockScript,
+                             @Qualifier("seckillSyncStockScript") RedisScript<Long> syncStockScript,
                              StockMapper stockMapper) {
         this.redisTemplate = redisTemplate;
         this.deductScript = deductScript;
         this.rollbackScript = rollbackScript;
         this.restoreStockScript = restoreStockScript;
+        this.syncStockScript = syncStockScript;
         this.stockMapper = stockMapper;
     }
 
@@ -269,14 +272,46 @@ public class StockCacheService {
     }
 
     /**
-     * 把 Redis 库存直接校准为给定值。
+     * 对账修复：把 Redis 库存校准为给定值，<b>但只在「读到的值没变」时才写</b>。
      * <p>
-     * <b>仅供对账修复调用</b>：它绕过了 Lua 的原子校验，是一次「相信数据库」的强制覆盖。
-     * 调用方必须先确认没有在途预扣，否则会把在途占用的名额一并释放出去。
+     * <b>仅供对账修复调用</b>。它是一次「相信数据库」的改写，因此必须自带三个前提：
+     * <ol>
+     *   <li><b>值比对（乐观锁）</b>：{@code expectedStock} 是对账读到的当前值，
+     *       期间只要有人预扣或归还过，值就变了 —— 本次直接放弃写入。
+     *       没有这道比对时，写回会把「读之后发生的那笔预扣」抹掉：Redis 多出一件可售，
+     *       而订单已经落库，用户随后看到「抢到了却下单失败」。</li>
+     *   <li><b>没有在途预扣</b>：调用方（对账）必须先确认在途口径可信，否则会把在途占用的
+     *       名额一并释放出去 —— 这是「算错期望值」的问题，值比对挡不住，只能靠口径。</li>
+     *   <li><b>没有悬空的归还义务</b>：待补偿任务也会 INCRBY 同一件库存，两处都动手就是
+     *       归还两次（库存虚增）。同样由调用方把关。</li>
+     * </ol>
+     *
+     * @param expectedStock 对账读到的当前值（乐观锁版本号）
+     * @param targetStock   要校准成的值
+     * @return true 表示本次校准已生效；false 表示未写入（值已被改动 / 活动已清理 / Redis 未返回）
      */
-    public void syncStock(Long stockId, long value) {
-        redisTemplate.opsForValue().set(SeckillRedisKeys.stock(stockId), String.valueOf(value));
-        log.warn("[对账修复] Redis 库存已强制校准。stockId={}, value={}", stockId, value);
+    public boolean syncStockIfUnchanged(Long stockId, long expectedStock, long targetStock) {
+        Long result = redisTemplate.execute(syncStockScript,
+                List.of(SeckillRedisKeys.stock(stockId)),
+                String.valueOf(expectedStock), String.valueOf(targetStock));
+
+        if (result == null) {
+            // 与回补路径同一取向：结果未知必须如实说，绝不能当成「已经修好了」
+            log.error("[对账修复] Redis 未返回结果，库存校准状态未知。stockId={}, 期望={}, 目标={}",
+                    stockId, expectedStock, targetStock);
+            return false;
+        }
+        if (result == 1L) {
+            log.warn("[对账修复] Redis 库存已校准。stockId={}, {} → {}", stockId, expectedStock, targetStock);
+            return true;
+        }
+        if (result == -1L) {
+            log.warn("[对账修复] 库存 key 不存在（活动已清理），本次未校准。stockId={}", stockId);
+            return false;
+        }
+        log.warn("[对账修复] 读取（{}）之后 Redis 库存又被改动，本次不覆盖，交由下一轮重新判定。stockId={}",
+                expectedStock, stockId);
+        return false;
     }
 
     /**

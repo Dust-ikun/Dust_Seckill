@@ -148,8 +148,21 @@ public class MaintenanceTask {
      * </ol>
      * MQ 未启用时（同步降级模式）两侧计数恒为 0，下面的比较天然判定已排空 ——
      * 那条链路上落库是同步完成的，本来就不存在在途，因此不必再单独判一次 Bean 是否存在。
+     * <p>
+     * 【门控必须封顶，否则它会掩盖最该报出来的故障】上面两条判据问的都是「还在忙吗」，
+     * 而消费者组一旦挂掉、消息在 Broker 侧丢失，这个问题的答案会<b>永远</b>是「是」：
+     * 门控一直关着 → 对账连报都不报 → 「消息没人消费」这件事彻底静默。
+     * 所以先看一条时间线：若该活动最老的 PENDING 预订单已经超过陈旧阈值
+     * （{@link StockReconcileService#pipelineStuck}），那就不是「忙」，是「卡住」，
+     * 直接放行、让对账把 STALE_PENDING 说出来。阈值与陈旧判定共用一份配置，
+     * 避免「门控挡住自己本该报出的问题」。
      */
     private boolean pipelineDrained(Long stockId) {
+        if (stockReconcileService.pipelineStuck(stockId)) {
+            log.warn("[维护任务·对账] stockId={} 链路长时间未排空（最老预订单已超过陈旧阈值），"
+                    + "本轮不再跳过 —— 卡住的链路正是最需要对账出声的时候", stockId);
+            return true;
+        }
         if (outboxService.countPendingByStockId(stockId) > 0) {
             log.debug("[维护任务·对账] stockId={} 仍有待投递记录，本次跳过", stockId);
             return false;
