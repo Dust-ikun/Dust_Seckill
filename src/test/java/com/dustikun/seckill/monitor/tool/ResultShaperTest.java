@@ -193,7 +193,10 @@ class ResultShaperTest {
     @Test
     @DisplayName("data 为 null 时不抛异常，返回一个合法的空结构")
     void nullDataIsTolerated() {
-        ToolResult weird = new ToolResult("t", ToolStatus.SUCCESS, null, false, List.of(), 0L, null, null);
+        // 直接用 record 的规范构造器传 null data：走 ok() 的话 null 已经被换成 Map.of()，
+        // 而这一条测的正是「实现违反了契约、给了 null」时整形器还稳不稳。
+        ToolResult weird = new ToolResult("t", ToolStatus.SUCCESS, null, false, List.of(), 0L, null, null,
+                Map.of());
         ResultShaper.Shaped shaped = shaper(8000).shape(weird);
         assertNotNull(shaped.text());
         assertEquals(Map.of(), shaped.data());

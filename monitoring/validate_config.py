@@ -895,6 +895,283 @@ else:
 
 
 # =============================================================================
+#  10. Agent 层（批次 3）：告警元数据、类型词汇一致性、以及「AI 不得自激」
+# =============================================================================
+#
+#  【这一组防的是什么】批次 3 让告警第一次真正驱动 LLM 调用 —— 于是三类问题
+#  第一次有了「花钱」或「闭环」的后果，而它们都属于「写错了不报错」：
+#
+#   1) 告警规则缺 value / threshold 注解（或写成 "1900ms" 这种带单位的字符串）。
+#      Alertmanager 的载荷里**没有数值**，只有 labels 与 annotations，
+#      因此 SPEC 第 7.1 节的 currentValue / threshold 只能由注解提供；
+#      而解析器刻意不做单位换算（换算错了会得到一个「看起来合理但差三个数量级」的数）。
+#      -> 检查 10.3：每条**路由到 AI** 的告警规则都必须有纯数字的 value / threshold。
+#
+#   2) 「告警名 -> 异常类型」的映射在两边各写了一遍（YAML 的 alert_type 标签
+#      与 AlertType.java 的索引表）。分叉的后果不是报错，而是**聚合键对不上**：
+#      同一个事故被拆成两个诊断任务，各付一次 LLM 费用。
+#      -> 检查 10.4：两处逐条对照，并且标签值必须是枚举里的常量。
+#
+#   3) metric_name 写了一个 MetricCatalog 里没有的名字。
+#      Agent 看到「指标：xxx」之后会去 query_metric(xxx)，而工具会以
+#      REJECTED 拒绝 —— 白白浪费一轮往返与一次模型调用。
+#      -> 检查 10.5：有 metric_name 的必须在目录里。
+#
+#   4) ★ 某条告警规则或看板的 PromQL 引用了 seckill_ai_*（AI 自身的指标）。
+#      那会形成自激闭环：Agent 一跑就写指标 -> 指标触发告警 -> 告警再触发诊断。
+#      它不会自己停下来，而每一圈都要付费。批次 2 已经在 reconcile 上踩过一次。
+#      -> 检查 10.6：静态禁止。纪律写在注释里会被忘掉，写成检查才会被遵守。
+# =============================================================================
+print("\n=== 10. Agent 层（批次 3）配置与不变量 ===")
+
+AGENT_SRC = os.path.join(ROOT, "src", "main", "java", "com", "dustikun", "seckill",
+                         "monitor", "core", "AlertType.java")
+ALERTS_FILE = os.path.join(RULES_DIR, "seckill-alerts.yml")
+
+# --- 10.1 读取告警规则（含 labels 与 annotations）---
+alert_meta = {}   # alertname -> {"alert_type":..., "metric_name":..., "value":..., "threshold":...}
+if os.path.exists(ALERTS_FILE):
+    with open(ALERTS_FILE, "r", encoding="utf-8") as f:
+        alerts_doc = yaml.safe_load(f) or {}
+    for group in alerts_doc.get("groups", []) or []:
+        for rule in group.get("rules", []) or []:
+            name = rule.get("alert")
+            if not name:
+                continue
+            labels = rule.get("labels", {}) or {}
+            ann = rule.get("annotations", {}) or {}
+            alert_meta[name] = {
+                "alert_type": labels.get("alert_type"),
+                "metric_name": ann.get("metric_name"),
+                "value": ann.get("value"),
+                "threshold": ann.get("threshold"),
+            }
+    ok(f"seckill-alerts.yml 读取到 {len(alert_meta)} 条告警规则")
+else:
+    fail("找不到 monitoring/prometheus/rules/seckill-alerts.yml")
+
+# --- 10.2 从 alertmanager.yml 推导「哪些告警会进入 AI 诊断」---
+#     【为什么必须推导而不是硬编码那份名单】因为名单的来源就是 alertmanager 的路由；
+#     在这里抄一遍，等于给「路由改了、校验没改」留了一个静默缺口。
+AM_FILE = os.path.join(ROOT, "monitoring", "alertmanager", "alertmanager.yml")
+ai_routed = []
+not_ai_routed = []
+if os.path.exists(AM_FILE):
+    am_doc = load_yaml("monitoring/alertmanager/alertmanager.yml")
+    root_route = (am_doc or {}).get("route", {}) or {}
+    default_receiver = root_route.get("receiver")
+    if default_receiver != "ai-monitor-webhook":
+        fail(f"alertmanager 的默认 receiver 是 {default_receiver}，"
+             f"而本校验按「默认接收者 = ai-monitor-webhook」推断哪些告警进入 AI 诊断。"
+             f"路由改了就必须同步这里，否则第 10 组的判断全是错的")
+    else:
+        ok("alertmanager 默认 receiver = ai-monitor-webhook（第 10 组据此判定「进入 AI 诊断」的告警）")
+
+    def _matcher_hits(matcher_text, alertname):
+        """判定一条 Alertmanager matcher（形如 'alertname =~ "A|B"'）是否命中某个告警名。
+
+        Prometheus 的正则是**完全匹配**（自动加 ^...$），因此这里用 fullmatch ——
+        用 search 会让 TargetDownBackup 命中 TargetDown 的规则，而那种偏差
+        会让一条本该送给 AI 的告警被静默排除。
+        """
+        m = re.match(r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(=~|!~|=|!=)\s*"?([^"]*)"?\s*$', matcher_text)
+        if not m:
+            return None
+        label, op, value = m.group(1), m.group(2), m.group(3)
+        if label != "alertname":
+            return None
+        if op == "=":
+            return alertname == value
+        if op == "!=":
+            return alertname != value
+        try:
+            hit = re.fullmatch(value, alertname) is not None
+        except re.error:
+            return None
+        return hit if op == "=~" else not hit
+
+    for name in sorted(alert_meta):
+        diverged = False
+        for sub in root_route.get("routes", []) or []:
+            for matcher in sub.get("matchers", []) or []:
+                if _matcher_hits(str(matcher), name) is True:
+                    diverged = True
+                    break
+            if diverged:
+                break
+        (not_ai_routed if diverged else ai_routed).append(name)
+
+    if ai_routed:
+        ok(f"按 alertmanager 路由推导：{len(ai_routed)} 条告警进入 AI 诊断，"
+           f"{len(not_ai_routed)} 条走别的 receiver（{not_ai_routed}）")
+    else:
+        fail("按 alertmanager 路由推导，没有任何告警会进入 AI 诊断 —— 路由 matcher 可能写错了")
+else:
+    fail("找不到 monitoring/alertmanager/alertmanager.yml，无法判定哪些告警进入 AI 诊断")
+
+# --- 10.3 进入 AI 诊断的告警必须有纯数字的 value / threshold ---
+missing_numeric = []
+bad_numeric = []
+for name in ai_routed:
+    meta = alert_meta[name]
+    if meta["value"] is None or meta["threshold"] is None:
+        missing_numeric.append(name)
+        continue
+    # threshold 必须是纯数字（写 "1s" / "99%" 都会被解析器判为读不出来）
+    try:
+        float(str(meta["threshold"]).strip())
+    except ValueError:
+        bad_numeric.append(f"{name}.threshold={meta['threshold']!r}")
+    # value 是模板：要么是纯数字，要么必须带 printf 的数字动词（%.Nf / %d / %g 等）
+    value_text = str(meta["value"])
+    if re.fullmatch(r'\s*-?\d+(\.\d+)?\s*', value_text):
+        continue
+    if "printf" in value_text and re.search(r'%[-+0-9.]*[dfgeE]', value_text):
+        continue
+    bad_numeric.append(f"{name}.value={value_text!r}")
+
+if missing_numeric:
+    fail(f"以下告警缺少 value/threshold 注解：{missing_numeric} —— "
+         f"Alertmanager 的载荷里没有数值，缺了它们 Agent 只能看到「未提供」，"
+         f"而 SPEC 第 7.1 节的 AlertEvent 要求 currentValue/threshold")
+elif bad_numeric:
+    fail(f"以下 value/threshold 不是纯数字模板：{bad_numeric} —— "
+         f"解析器不做单位换算（\"1900ms\" 会被判为读不出来），"
+         f"请用 '{{{{ printf \"%.4f\" $value }}}}' 这种形态")
+else:
+    ok(f"进入 AI 诊断的 {len(ai_routed)} 条告警都有纯数字的 value/threshold 注解")
+
+# --- 10.4 告警类型词汇一致性：YAML 的 alert_type 标签 vs AlertType.java ---
+if os.path.exists(AGENT_SRC):
+    with open(AGENT_SRC, "r", encoding="utf-8") as f:
+        agent_src = f.read()
+
+    enum_constants = set(re.findall(r'^\s{4}([A-Z][A-Z0-9_]*)\s*[,;]\s*$', agent_src, re.M))
+    index_map = dict(re.findall(r'map\.put\("([^"]+)",\s*([A-Z_0-9]+)\);', agent_src))
+
+    if not enum_constants or not index_map:
+        warn("未能从 AlertType.java 解析出枚举常量或索引表（解析规则可能已失效，请检查本检查项）")
+    else:
+        unknown_labels = []
+        mismatched = []
+        for name in ai_routed:
+            label = alert_meta[name]["alert_type"]
+            if not label:
+                unknown_labels.append(f"{name}(缺失)")
+                continue
+            if label not in enum_constants:
+                unknown_labels.append(f"{name}={label}")
+                continue
+            mapped = index_map.get(name)
+            if mapped != label:
+                mismatched.append(f"{name}: 标签={label} 索引表={mapped}")
+
+        if unknown_labels:
+            fail(f"以下 alert_type 标签不在 AlertType 枚举里：{unknown_labels} —— "
+                 f"拼错的类型名会让它落进 UNKNOWN，而 UNKNOWN 仍然会触发诊断（按设计），"
+                 f"于是「类型写错了」这件事没有任何症状")
+        elif mismatched:
+            fail(f"alert_type 标签与 AlertType 索引表不一致：{mismatched} —— "
+                 f"两边分叉的后果是聚合键对不上：同一个事故被拆成两个诊断任务，各付一次 LLM 费用")
+        else:
+            ok(f"{len(ai_routed)} 条告警的 alert_type 标签与 AlertType.java 索引表逐条一致"
+               f"（{len(enum_constants)} 个类型常量）")
+
+        # 反向：索引表里登记的告警名必须在 YAML 里真实存在（防止规则改名后留下死映射）
+        dead = [name for name in index_map if name not in alert_meta]
+        if dead:
+            warn(f"AlertType 索引表里有 {len(dead)} 个告警名在 seckill-alerts.yml 中不存在：{dead} —— "
+                 f"规则改名后留下的死映射不会报错，只会让 fromAlertName 回落到 UNKNOWN")
+        else:
+            ok("AlertType 索引表里的告警名都真实存在（没有改名后遗留的死映射）")
+else:
+    warn("找不到 AlertType.java，跳过告警类型词汇一致性核查")
+
+# --- 10.5 metric_name 必须在 MetricCatalog 里（否则 Agent 会白跑一次 query_metric）---
+if os.path.exists(CATALOG_PATH):
+    with open(CATALOG_PATH, "r", encoding="utf-8") as f:
+        catalog_for_agent = f.read()
+    catalog_keys = set(re.findall(r'new Entry\("([^"]+)"', catalog_for_agent))
+    if not catalog_keys:
+        warn("未能从 MetricCatalog.java 解析出口径名，跳过 metric_name 核查")
+    else:
+        bad_metrics = [f"{name}={alert_meta[name]['metric_name']}"
+                       for name in ai_routed
+                       if alert_meta[name]["metric_name"]
+                       and alert_meta[name]["metric_name"] not in catalog_keys]
+        with_metric = sum(1 for name in ai_routed if alert_meta[name]["metric_name"])
+        if bad_metrics:
+            fail(f"以下 metric_name 不在 MetricCatalog 里：{bad_metrics} —— "
+                 f"Agent 会照着 prompt 里的「指标」去调 query_metric，而工具会以 REJECTED 拒绝，"
+                 f"白白浪费一轮 LLM 往返。可用口径共 {len(catalog_keys)} 个")
+        else:
+            ok(f"告警里的 metric_name 全部是 MetricCatalog 的口径名"
+               f"（{with_metric}/{len(ai_routed)} 条有 metric_name，"
+               f"其余刻意省略：表达式没有单一可查口径时宁可不写）")
+
+# --- 10.6 ★ 静态禁止：告警规则与看板不得引用 AI 自身指标（防自激闭环）---
+AI_METRIC_PREFIX = "seckill_ai_"
+self_reference_hits = []
+
+for filename in rule_files:
+    rel = f"monitoring/prometheus/rules/{filename}"
+    doc = load_yaml(rel)
+    if not doc:
+        continue
+    for group in doc.get("groups", []) or []:
+        for rule in group.get("rules", []) or []:
+            blob = json.dumps(rule, ensure_ascii=False)
+            if AI_METRIC_PREFIX in blob:
+                self_reference_hits.append(f"{filename}:{rule.get('alert') or rule.get('record')}")
+
+for filename in dash_files if 'dash_files' in dir() else []:
+    rel = f"monitoring/grafana/dashboards/{filename}"
+    with open(os.path.join(ROOT, rel), "r", encoding="utf-8") as f:
+        if AI_METRIC_PREFIX in f.read():
+            self_reference_hits.append(f"dashboards/{filename}")
+
+if self_reference_hits:
+    fail(f"以下位置引用了 AI 自身指标（{AI_METRIC_PREFIX}*）：{self_reference_hits} —— "
+         f"那会形成自激闭环：Agent 一跑就写指标 -> 指标触发告警 -> 告警再触发诊断。"
+         f"它不会自己停下来，而每一圈都要付费（批次 2 已在 reconcile 上踩过一次）。"
+         f"要观察 Agent 的健康状况请查 ai_diagnosis_task / ai_tool_execution 这两张事实表")
+else:
+    ok(f"告警规则与看板都没有引用 AI 自身指标（{AI_METRIC_PREFIX}*）—— 没有自激闭环")
+
+# --- 10.7 批次 3 的配置键真的存在 ---
+monitor = (app or {}).get("seckill", {}).get("monitor", {})
+llm = monitor.get("llm", {}) or {}
+incident = monitor.get("incident", {}) or {}
+REQUIRED_AGENT_KEYS = {
+    "seckill.monitor.enabled": monitor.get("enabled"),
+    "seckill.monitor.llm.enabled": llm.get("enabled"),
+    "seckill.monitor.llm.base-url": llm.get("base-url"),
+    "seckill.monitor.llm.chat-path": llm.get("chat-path"),
+    "seckill.monitor.llm.model": llm.get("model"),
+    "seckill.monitor.llm.api-key": llm.get("api-key"),
+    "seckill.monitor.llm.timeout-ms": llm.get("timeout-ms"),
+    "seckill.monitor.llm.max-retries": llm.get("max-retries"),
+    "seckill.monitor.llm.max-tokens": llm.get("max-tokens"),
+    "seckill.monitor.llm.temperature": llm.get("temperature"),
+    "seckill.monitor.incident.aggregate-window-seconds": incident.get("aggregate-window-seconds"),
+    "seckill.monitor.incident.aggregate-by": incident.get("aggregate-by"),
+}
+missing_agent_keys = [k for k, v in REQUIRED_AGENT_KEYS.items() if v is None]
+if missing_agent_keys:
+    fail(f"application-docker.yaml 缺少 Agent 层配置键 {missing_agent_keys} —— "
+         f"少了它们会静默回落到代码默认值（改配置没反应，本项目已记录过三次同类问题）")
+else:
+    ok(f"Agent 层配置键齐备（{len(REQUIRED_AGENT_KEYS)} 项：LLM 接入 + Incident 聚合）")
+
+# aggregate-by 只支持一个值：跨类型合并属于 Agent 的推理，不该由聚合层下结论
+aggregate_by = str(incident.get("aggregate-by", "")).replace(" ", "")
+if aggregate_by and aggregate_by != "service,alertType":
+    fail(f"seckill.monitor.incident.aggregate-by={incident.get('aggregate-by')} 不受支持 —— "
+         f"本项目只实现「同服务 + 同异常类型」（SPEC 第 16 节）。"
+         f"MonitorIncidentProperties#validate 会在启动时拒绝它，这里提前报出来")
+
+
+# =============================================================================
 #  汇总
 # =============================================================================
 print("\n" + "=" * 76)

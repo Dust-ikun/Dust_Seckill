@@ -7,8 +7,8 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 一次 Tool 调用的结果（对应 {@code ai_tool_execution} 的 result / status /
- * execution_time_ms / error_message 四列，外加给 LLM 的那段文本）。
+ * 一次 Tool 调用的结果（对应 {@code ai_tool_execution} 的 arguments / result / status /
+ * execution_time_ms / error_message 五列，外加给 LLM 的那段文本）。
  *
  * <h2>为什么结果体是 Map 而不是每个 Tool 一个 record</h2>
  * <p>
@@ -31,6 +31,21 @@ import java.util.Map;
  * @param llmText       真正交给 LLM 的那段文本（已脱敏、已收缩、已用
  *                      {@code <untrusted_data>} 包裹）。由 {@link ResultShaper} 填充，
  *                      未整形前为 {@code null}
+ * @param arguments     落 {@code ai_tool_execution.arguments} 的值。取哪一份由
+ *                      {@link ToolRegistry} 按下面的规则决定，**不是**随手记一下：
+ *                      <ul>
+ *                        <li><b>REJECTED（没有执行）→ 原始入参</b>。此时「校验后的值」
+ *                            并不存在，而排查需要看到的恰恰是模型到底传了什么
+ *                            （「它为什么被拒」的全部信息都在原始串里）；</li>
+ *                        <li><b>SUCCESS / FAILED（已执行）→ {@link ToolArguments#accepted()}</b>。
+ *                            那才是工具真正使用的值（含默认值），也是解释
+ *                            「为什么返回这个结果」的依据。</li>
+ *                      </ul>
+ *                      【为什么参数不做脱敏】它是<b>模型自己的输出</b>，不是从数据源读回的内容，
+ *                      而且轨迹的价值就在于「当时到底问了什么」——脱敏掉它，
+ *                      {@code ai_tool_execution} 就不再可复现。真正需要脱敏的是
+ *                      {@code data} / {@code llmText}（那些来自日志与数据库），
+ *                      它们已经过了 {@link ResultShaper}。
  */
 public record ToolResult(
         String toolName,
@@ -40,7 +55,8 @@ public record ToolResult(
         List<String> notes,
         long elapsedMillis,
         String errorMessage,
-        String llmText
+        String llmText,
+        Map<String, Object> arguments
 ) {
 
     /**
@@ -53,7 +69,7 @@ public record ToolResult(
                 data == null ? Map.of() : data,
                 false,
                 notes == null ? List.of() : List.copyOf(notes),
-                0L, null, null);
+                0L, null, null, Map.of());
     }
 
     public static ToolResult ok(String toolName, Map<String, Object> data) {
@@ -62,12 +78,12 @@ public record ToolResult(
 
     public static ToolResult failed(String toolName, String errorMessage, List<String> notes) {
         return new ToolResult(toolName, ToolStatus.FAILED, Map.of(), false,
-                notes == null ? List.of() : List.copyOf(notes), 0L, errorMessage, null);
+                notes == null ? List.of() : List.copyOf(notes), 0L, errorMessage, null, Map.of());
     }
 
     public static ToolResult rejected(String toolName, String errorMessage) {
         return new ToolResult(toolName, ToolStatus.REJECTED, Map.of(), false,
-                List.of(), 0L, errorMessage, null);
+                List.of(), 0L, errorMessage, null, Map.of());
     }
 
     public boolean successful() {
@@ -76,7 +92,17 @@ public record ToolResult(
 
     /** 回填耗时并返回新实例（record 不可变，因此只能这样） */
     public ToolResult withElapsed(long millis) {
-        return new ToolResult(toolName, status, data, truncated, notes, millis, errorMessage, llmText);
+        return new ToolResult(toolName, status, data, truncated, notes, millis,
+                errorMessage, llmText, arguments);
+    }
+
+    /**
+     * 回填「落 {@code ai_tool_execution.arguments} 的那份值」。
+     * <p>它由 {@link ToolRegistry} 在整形之前调用，取值规则见 {@link #arguments} 的注释。
+     */
+    public ToolResult withArguments(Map<String, Object> newArguments) {
+        return new ToolResult(toolName, status, data, truncated, notes, elapsedMillis,
+                errorMessage, llmText, newArguments == null ? Map.of() : newArguments);
     }
 
     /**
@@ -88,7 +114,7 @@ public record ToolResult(
     public ToolResult withShaped(Map<String, Object> newData, boolean newTruncated,
                                  List<String> newNotes, String newLlmText) {
         return new ToolResult(toolName, status, newData, newTruncated, newNotes,
-                elapsedMillis, errorMessage, newLlmText);
+                elapsedMillis, errorMessage, newLlmText, arguments);
     }
 
     /**
@@ -105,7 +131,7 @@ public record ToolResult(
         merged.addAll(notes);
         merged.add(note);
         return new ToolResult(toolName, status, data, truncated, List.copyOf(merged),
-                elapsedMillis, errorMessage, null);
+                elapsedMillis, errorMessage, null, arguments);
     }
 
     /**
@@ -113,6 +139,9 @@ public record ToolResult(
      * 也是 {@code ai_tool_execution.result} 列的内容）。
      * <p>注意真正的渲染由 {@link ResultShaper} 负责 —— 它会把 notes 与 truncated
      * 一起编进 body。本方法保留给「不需要包裹的场合」（例如直接落库的测试）。
+     * <p>【为什么 {@code arguments} 不在里面】因为它有自己的一列
+     * （{@code ai_tool_execution.arguments}）。把同一份数据放进两列，
+     * 某天它们不一致时就没有第二处能对照。
      */
     public Map<String, Object> envelope() {
         Map<String, Object> body = new LinkedHashMap<>(6);

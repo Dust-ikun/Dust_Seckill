@@ -42,6 +42,15 @@ groups:
           service: order-service
           alert_type: SERVICE_DOWN
         annotations:
+          # ↓ 下面三项是给 AI 诊断用的（SPEC 第 7.1 节的 AlertEvent / 第 10 节的动态上下文）。
+          #   Alertmanager 的载荷里**没有数值**，只有 labels 与 annotations，
+          #   因此 currentValue / threshold 只能写在这里；解析器不做任何单位换算，
+          #   所以它们必须是**纯数字**模板（写成 "1900ms" 会被判为读不出来，见 AlertmanagerPayload#readNumber）。
+          #   metric_name 取的是 MetricCatalog 里的**口径名**（不是底层序列名），
+          #   这样 Agent 可以立刻用 query_metric 查它；validate_config.py 第 10 组会校验它确实在目录里。
+          metric_name: "target_up"
+          value: '{{ printf "%.0f" $value }}'
+          threshold: "0"
           summary: "业务应用不可达（Prometheus 抓不到 /actuator/prometheus）"
           description: >-
             目标 {{ $labels.instance }} 已经连续 1 分钟抓取失败。
@@ -68,6 +77,15 @@ groups:
           service: order-service
           alert_type: DB_POOL_EXHAUSTED
         annotations:
+          # ↓ 下面三项是给 AI 诊断用的（SPEC 第 7.1 节的 AlertEvent / 第 10 节的动态上下文）。
+          #   Alertmanager 的载荷里**没有数值**，只有 labels 与 annotations，
+          #   因此 currentValue / threshold 只能写在这里；解析器不做任何单位换算，
+          #   所以它们必须是**纯数字**模板（写成 "1900ms" 会被判为读不出来，见 AlertmanagerPayload#readNumber）。
+          #   metric_name 取的是 MetricCatalog 里的**口径名**（不是底层序列名），
+          #   这样 Agent 可以立刻用 query_metric 查它；validate_config.py 第 10 组会校验它确实在目录里。
+          metric_name: "db_pool_usage"
+          value: '{{ printf "%.4f" $value }}'
+          threshold: "0.9"
           summary: "数据库连接池利用率超过 90%"
           description: >-
             活跃连接 {{ printf "%.1f" $value }} 倍于池上限。
@@ -99,6 +117,15 @@ groups:
           service: order-service
           alert_type: LATENCY_HIGH
         annotations:
+          # ↓ 下面三项是给 AI 诊断用的（SPEC 第 7.1 节的 AlertEvent / 第 10 节的动态上下文）。
+          #   Alertmanager 的载荷里**没有数值**，只有 labels 与 annotations，
+          #   因此 currentValue / threshold 只能写在这里；解析器不做任何单位换算，
+          #   所以它们必须是**纯数字**模板（写成 "1900ms" 会被判为读不出来，见 AlertmanagerPayload#readNumber）。
+          #   metric_name 取的是 MetricCatalog 里的**口径名**（不是底层序列名），
+          #   这样 Agent 可以立刻用 query_metric 查它；validate_config.py 第 10 组会校验它确实在目录里。
+          metric_name: "http_p99_latency"
+          value: '{{ printf "%.4f" $value }}'
+          threshold: "1"
           summary: "接口 {{ $labels.uri }} 的 P99 延迟超过 1s（当前 {{ printf \"%.2f\" $value }}s）"
           description: >-
             与 SPEC 第 7.2 节的 AlertEvent 示例一一对应：
@@ -121,6 +148,15 @@ groups:
           service: order-service
           alert_type: ERROR_RATE_HIGH
         annotations:
+          # ↓ 下面三项是给 AI 诊断用的（SPEC 第 7.1 节的 AlertEvent / 第 10 节的动态上下文）。
+          #   Alertmanager 的载荷里**没有数值**，只有 labels 与 annotations，
+          #   因此 currentValue / threshold 只能写在这里；解析器不做任何单位换算，
+          #   所以它们必须是**纯数字**模板（写成 "1900ms" 会被判为读不出来，见 AlertmanagerPayload#readNumber）。
+          #   metric_name 取的是 MetricCatalog 里的**口径名**（不是底层序列名），
+          #   这样 Agent 可以立刻用 query_metric 查它；validate_config.py 第 10 组会校验它确实在目录里。
+          metric_name: "http_error_rate_all"
+          value: '{{ printf "%.4f" $value }}'
+          threshold: "0.05"
           summary: "接口 5xx 错误率超过 5%（当前 {{ printf \"%.2f\" $value }}）"
           description: >-
             仅统计 5xx。库存不足 / 重复下单这类业务拒绝走 4xx，不计入本告警。
@@ -144,6 +180,15 @@ groups:
           service: order-service
           alert_type: LATENCY_HIGH
         annotations:
+          # ↓ 下面三项是给 AI 诊断用的（SPEC 第 7.1 节的 AlertEvent / 第 10 节的动态上下文）。
+          #   Alertmanager 的载荷里**没有数值**，只有 labels 与 annotations，
+          #   因此 currentValue / threshold 只能写在这里；解析器不做任何单位换算，
+          #   所以它们必须是**纯数字**模板（写成 "1900ms" 会被判为读不出来，见 AlertmanagerPayload#readNumber）。
+          #   metric_name 取的是 MetricCatalog 里的**口径名**（不是底层序列名），
+          #   这样 Agent 可以立刻用 query_metric 查它；validate_config.py 第 10 组会校验它确实在目录里。
+          metric_name: "http_slow_request_rate"
+          value: '{{ printf "%.4f" $value }}'
+          threshold: "0.2"
           summary: "接口 {{ $labels.uri }} 超过 1s 的请求占比达到 {{ printf \"%.2f\" $value }}"
           description: >-
             大面积慢请求。优先怀疑共享资源：数据库连接池、Redis 单线程、
@@ -182,6 +227,15 @@ groups:
           service: order-service
           alert_type: DB_SLOW_QUERY
         annotations:
+          # ↓ 下面三项是给 AI 诊断用的（SPEC 第 7.1 节的 AlertEvent / 第 10 节的动态上下文）。
+          #   Alertmanager 的载荷里**没有数值**，只有 labels 与 annotations，
+          #   因此 currentValue / threshold 只能写在这里；解析器不做任何单位换算，
+          #   所以它们必须是**纯数字**模板（写成 "1900ms" 会被判为读不出来，见 AlertmanagerPayload#readNumber）。
+          #   metric_name 取的是 MetricCatalog 里的**口径名**（不是底层序列名），
+          #   这样 Agent 可以立刻用 query_metric 查它；validate_config.py 第 10 组会校验它确实在目录里。
+          metric_name: "http_slow_request_rate"
+          value: '{{ printf "%.4f" $value }}'
+          threshold: "5"
           summary: "秒杀接口超过 1s 的请求持续出现（> 5 次/秒）"
           description: >-
             Case 1 的特征信号。Agent 应继续调用 DB Tool 的 get_slow_sql()
@@ -211,6 +265,15 @@ groups:
           service: order-service
           alert_type: BUSINESS_SUCCESS_RATE_LOW
         annotations:
+          # ↓ 下面三项是给 AI 诊断用的（SPEC 第 7.1 节的 AlertEvent / 第 10 节的动态上下文）。
+          #   Alertmanager 的载荷里**没有数值**，只有 labels 与 annotations，
+          #   因此 currentValue / threshold 只能写在这里；解析器不做任何单位换算，
+          #   所以它们必须是**纯数字**模板（写成 "1900ms" 会被判为读不出来，见 AlertmanagerPayload#readNumber）。
+          #   metric_name 取的是 MetricCatalog 里的**口径名**（不是底层序列名），
+          #   这样 Agent 可以立刻用 query_metric 查它；validate_config.py 第 10 组会校验它确实在目录里。
+          metric_name: "order_success_rate"
+          value: '{{ printf "%.4f" $value }}'
+          threshold: "0.99"
           summary: "订单确认成功率低于 99%（当前 {{ printf \"%.4f\" $value }}）"
           description: >-
             这是**业务侧**的最终信号，比任何技术指标都更接近用户的真实感受。
@@ -252,6 +315,15 @@ groups:
           service: order-service
           alert_type: MQ_LAG_HIGH
         annotations:
+          # ↓ 下面三项是给 AI 诊断用的（SPEC 第 7.1 节的 AlertEvent / 第 10 节的动态上下文）。
+          #   Alertmanager 的载荷里**没有数值**，只有 labels 与 annotations，
+          #   因此 currentValue / threshold 只能写在这里；解析器不做任何单位换算，
+          #   所以它们必须是**纯数字**模板（写成 "1900ms" 会被判为读不出来，见 AlertmanagerPayload#readNumber）。
+          #   metric_name 取的是 MetricCatalog 里的**口径名**（不是底层序列名），
+          #   这样 Agent 可以立刻用 query_metric 查它；validate_config.py 第 10 组会校验它确实在目录里。
+          metric_name: "mq_lag_growth_rate"
+          value: '{{ printf "%.2f" $value }}'
+          threshold: "5"
           summary: "消息投递速率超过消费速率，队列正在堆积（净增长 {{ printf \"%.1f\" $value }} 条/秒）"
           description: >-
             Case 3 的特征信号。四类消费结局全部计入在途，
@@ -281,6 +353,15 @@ groups:
           service: order-service
           alert_type: OUTBOX_BACKLOG
         annotations:
+          # ↓ 下面三项是给 AI 诊断用的（SPEC 第 7.1 节的 AlertEvent / 第 10 节的动态上下文）。
+          #   Alertmanager 的载荷里**没有数值**，只有 labels 与 annotations，
+          #   因此 currentValue / threshold 只能写在这里；解析器不做任何单位换算，
+          #   所以它们必须是**纯数字**模板（写成 "1900ms" 会被判为读不出来，见 AlertmanagerPayload#readNumber）。
+          #   metric_name 取的是 MetricCatalog 里的**口径名**（不是底层序列名），
+          #   这样 Agent 可以立刻用 query_metric 查它；validate_config.py 第 10 组会校验它确实在目录里。
+          metric_name: "outbox_pending"
+          value: '{{ printf "%.0f" $value }}'
+          threshold: "1000"
           summary: "Outbox 待投递记录积压超过 1000 条（当前 {{ printf \"%.0f\" $value }}）"
           description: >-
             Case 4 的特征信号：已受理但消息还没进 Broker。
@@ -308,6 +389,15 @@ groups:
           service: order-service
           alert_type: DATA_INCONSISTENCY
         annotations:
+          # ↓ 下面三项是给 AI 诊断用的（SPEC 第 7.1 节的 AlertEvent / 第 10 节的动态上下文）。
+          #   Alertmanager 的载荷里**没有数值**，只有 labels 与 annotations，
+          #   因此 currentValue / threshold 只能写在这里；解析器不做任何单位换算，
+          #   所以它们必须是**纯数字**模板（写成 "1900ms" 会被判为读不出来，见 AlertmanagerPayload#readNumber）。
+          #   metric_name 取的是 MetricCatalog 里的**口径名**（不是底层序列名），
+          #   这样 Agent 可以立刻用 query_metric 查它；validate_config.py 第 10 组会校验它确实在目录里。
+          metric_name: "manual_intervention_backlog"
+          value: '{{ printf "%.0f" $value }}'
+          threshold: "0"
           summary: "存在不会自愈的欠账，需要人工介入（当前 {{ printf \"%.0f\" $value }} 条）"
           description: >-
             outbox FAILED 与 compensate PENDING 之和大于 0。
@@ -332,6 +422,15 @@ groups:
           service: order-service
           alert_type: DATA_INCONSISTENCY
         annotations:
+          # ↓ 下面三项是给 AI 诊断用的（SPEC 第 7.1 节的 AlertEvent / 第 10 节的动态上下文）。
+          #   Alertmanager 的载荷里**没有数值**，只有 labels 与 annotations，
+          #   因此 currentValue / threshold 只能写在这里；解析器不做任何单位换算，
+          #   所以它们必须是**纯数字**模板（写成 "1900ms" 会被判为读不出来，见 AlertmanagerPayload#readNumber）。
+          #   metric_name 取的是 MetricCatalog 里的**口径名**（不是底层序列名），
+          #   这样 Agent 可以立刻用 query_metric 查它；validate_config.py 第 10 组会校验它确实在目录里。
+          metric_name: "reconcile_findings_rate"
+          value: '{{ printf "%.4f" $value }}'
+          threshold: "0"
           summary: "对账结论 {{ $labels.status }} 正在持续产生"
           description: >-
             Case 5 的特征信号：Redis 与数据库的真实状态出现偏差。
@@ -351,6 +450,15 @@ groups:
           service: order-service
           alert_type: DATA_INCONSISTENCY
         annotations:
+          # ↓ 下面三项是给 AI 诊断用的（SPEC 第 7.1 节的 AlertEvent / 第 10 节的动态上下文）。
+          #   Alertmanager 的载荷里**没有数值**，只有 labels 与 annotations，
+          #   因此 currentValue / threshold 只能写在这里；解析器不做任何单位换算，
+          #   所以它们必须是**纯数字**模板（写成 "1900ms" 会被判为读不出来，见 AlertmanagerPayload#readNumber）。
+          #   本条规则刻意**不写** metric_name：它的表达式没有单一可查口径，
+          #   写一个近似的名字会诱导 Agent 去查一个不是这条告警依据的指标。
+          #   此时 AlertEvent.metricName 回落到告警名（明确表示「没有直接对应的指标」）。
+          value: '{{ printf "%.4f" $value }}'
+          threshold: "0"
           summary: "消费端发现待投递凭据对应的订单不存在"
           description: >-
             该口径的含义很具体：orders 里有 outbox 凭据、orders 里却没有这条订单。
@@ -382,6 +490,15 @@ groups:
           service: order-service
           alert_type: REDIS_UNAVAILABLE
         annotations:
+          # ↓ 下面三项是给 AI 诊断用的（SPEC 第 7.1 节的 AlertEvent / 第 10 节的动态上下文）。
+          #   Alertmanager 的载荷里**没有数值**，只有 labels 与 annotations，
+          #   因此 currentValue / threshold 只能写在这里；解析器不做任何单位换算，
+          #   所以它们必须是**纯数字**模板（写成 "1900ms" 会被判为读不出来，见 AlertmanagerPayload#readNumber）。
+          #   本条规则刻意**不写** metric_name：它的表达式没有单一可查口径，
+          #   写一个近似的名字会诱导 Agent 去查一个不是这条告警依据的指标。
+          #   此时 AlertEvent.metricName 回落到告警名（明确表示「没有直接对应的指标」）。
+          value: '{{ printf "%.4f" $value }}'
+          threshold: "0"
           summary: "Redis 不可用触发降级，链路由 MySQL 兜底"
           description: >-
             [触发方式] Case 2：`docker compose pause redis` 或
@@ -421,6 +538,15 @@ groups:
           service: order-service
           alert_type: REDIS_LATENCY_HIGH
         annotations:
+          # ↓ 下面三项是给 AI 诊断用的（SPEC 第 7.1 节的 AlertEvent / 第 10 节的动态上下文）。
+          #   Alertmanager 的载荷里**没有数值**，只有 labels 与 annotations，
+          #   因此 currentValue / threshold 只能写在这里；解析器不做任何单位换算，
+          #   所以它们必须是**纯数字**模板（写成 "1900ms" 会被判为读不出来，见 AlertmanagerPayload#readNumber）。
+          #   metric_name 取的是 MetricCatalog 里的**口径名**（不是底层序列名），
+          #   这样 Agent 可以立刻用 query_metric 查它；validate_config.py 第 10 组会校验它确实在目录里。
+          metric_name: "redis_command_latency_p99"
+          value: '{{ printf "%.4f" $value }}'
+          threshold: "0.05"
           summary: "Redis 命令 {{ $labels.db_operation }} 的客户端侧 P99 超过 50ms"
           description: >-
             本地环境 Redis 是同机容器，正常 P99 应在 1ms 以内。

@@ -161,17 +161,21 @@ public final class ToolRegistry implements AutoCloseable {
      */
     public ToolResult invoke(String toolName, Map<String, Object> arguments) {
         long startNanos = System.nanoTime();
+        Map<String, Object> rawArguments = arguments == null ? Map.of() : arguments;
 
         if (toolName == null || toolName.isBlank()) {
             return finish(ToolResult.rejected("-",
-                    "未提供工具名。可用工具：" + String.join(", ", names())), startNanos);
+                    "未提供工具名。可用工具：" + String.join(", ", names())), startNanos, rawArguments);
         }
         MonitorTool tool = byName.get(normalize(toolName));
         if (tool == null) {
             // 错误消息里带上白名单：这是唯一能让模型（或下一次调试的人）
             // 自己纠正的工具，而它几乎不花成本。
+            // 入参存**原始**的那一份：这里没有「校验后的值」可言，而「模型编了一个
+            // 什么工具名、还给它传了什么」正是排查幻觉调用时唯一的证据。
+            // 它的体积是有界的 —— Agent 侧的 ToolCallRequest 已把参数串截到 8KB。
             return finish(ToolResult.rejected(toolName.trim(), "未注册的 Tool（白名单拒绝）。可用工具："
-                    + String.join(", ", names())), startNanos);
+                    + String.join(", ", names())), startNanos, rawArguments);
         }
 
         ToolArguments args = ToolArguments.of(tool.name(), arguments);
@@ -179,25 +183,27 @@ public final class ToolRegistry implements AutoCloseable {
         try {
             result = executeWithTimeout(tool, args);
         } catch (ToolArgumentException e) {
-            // 参数校验失败：没有触达数据源，属于 REJECTED
+            // 参数校验失败：没有触达数据源，属于 REJECTED。
+            // 同样存原始入参：之所以被拒，原因就在模型传的那个串里。
             log.warn("[ToolRegistry] 参数校验拒绝：tool={}, 原因={}", tool.name(), e.describe());
-            return finish(ToolResult.rejected(tool.name(), e.describe()), startNanos);
+            return finish(ToolResult.rejected(tool.name(), e.describe()), startNanos,
+                    args.raw() == null ? Map.of() : args.raw());
         } catch (ToolTimeoutException e) {
             log.warn("[ToolRegistry] Tool 执行超时：tool={}, 超时={}ms", tool.name(), timeoutMillis);
             return finish(ToolResult.failed(tool.name(),
                     "执行超时（上限 " + timeoutMillis + "ms）。可能是数据源不可达或查询过重；"
-                            + "请缩小查询范围或改用其它证据来源。", List.of()), startNanos);
+                            + "请缩小查询范围或改用其它证据来源。", List.of()), startNanos, rawArguments);
         } catch (RuntimeException e) {
             log.error("[ToolRegistry] Tool 执行异常：tool={}", tool.name(), e);
             return finish(ToolResult.failed(tool.name(),
                     "执行异常 " + e.getClass().getSimpleName() + "：" + e.getMessage(), List.of()),
-                    startNanos);
+                    startNanos, rawArguments);
         }
         if (result == null) {
             // 实现返回 null 是契约违反，但把它变成一次 FAILED 比抛 NPE 更有用：
             // 轨迹里会留下「这个工具没有返回结果」这条事实。
             return finish(ToolResult.failed(tool.name(), "Tool 返回了 null，违反契约。", List.of()),
-                    startNanos);
+                    startNanos, rawArguments);
         }
 
         // 参数登记放在执行之后：只有走完 getter 的字段才算「被认识」的，
@@ -207,11 +213,47 @@ public final class ToolRegistry implements AutoCloseable {
             result = result.withNote("入参里包含未定义字段，已忽略：" + String.join(", ", args.ignored())
                     + "。请只使用参数说明里列出的字段。");
         }
-        return finish(result, startNanos);
+        // 已执行的调用存 accepted()：那才是工具真正用的值（含默认值）。
+        return finish(result, startNanos, args.accepted());
     }
 
     /**
-     * 所有返回路径的<b>唯一</b>出口：回填耗时 → 整形（脱敏 + 体积收缩 + 不可信包裹）→ 记日志。
+     * 拒绝一次调用，但<b>不执行</b>它 —— 批次 3 的 ReAct 循环专用。
+     *
+     * <h2>为什么这个方法必须存在，而不是让 Agent 自己造一个失败结果</h2>
+     * <p>
+     * 模型给出的 {@code arguments} 是一个字符串，它<b>可能是坏的 JSON</b>
+     * （被 max_tokens 截断、混进中文引号）。此时循环需要「记一次失败的调用并回灌给模型」，
+     * 而它不能走 {@link #invoke} —— 那会真的执行工具（用一个空参数去查，
+     * 于是轨迹里出现一次「成功」的调用，但它查的东西根本不是模型想要的：
+     * 结论有证据，证据是假的）。
+     *
+     * <p>若循环自己 {@code new} 一个 {@link ToolResult#rejected}，那个结果就<b>绕过了
+     * {@link #finish} 这条唯一出口</b> —— {@code llmText} 会是 {@code null}，
+     * 模型侧什么都看不到（表现为「轨迹里有记录、模型却以为没查过，于是重复调用」，
+     * 每次诊断的费用翻倍）。批次 2 正是为了这件事把三条失败路径收敛进 {@code finish} 的。
+     *
+     * <p>白名单仍然由这里判定：名字不在白名单时，返回的是「未注册」这条消息
+     * （而不是调用方编的那句），因为「这个工具到底存不存在」只有本类知道。
+     *
+     * @param toolName 模型给出的工具名
+     * @param reason   拒绝原因（会出现在 {@code error_message} 与给模型的文本里）
+     */
+    public ToolResult reject(String toolName, String reason) {
+        long startNanos = System.nanoTime();
+        if (toolName == null || toolName.isBlank()) {
+            return finish(ToolResult.rejected("-", reason), startNanos, Map.of());
+        }
+        String name = toolName.trim();
+        if (!isRegistered(name)) {
+            return finish(ToolResult.rejected(name, "未注册的 Tool（白名单拒绝）。可用工具："
+                    + String.join(", ", names())), startNanos, Map.of());
+        }
+        return finish(ToolResult.rejected(name, reason), startNanos, Map.of());
+    }
+
+    /**
+     * 所有返回路径的<b>唯一</b>出口：回填入参与耗时 → 整形（脱敏 + 体积收缩 + 不可信包裹）→ 记日志。
      *
      * <p>【为什么必须收敛成一个出口】初版让「未注册的工具」「参数被拒」「执行超时」三条路径
      * 各自 {@code return}，于是它们的结果<b>没有经过整形</b>：
@@ -219,9 +261,13 @@ public final class ToolRegistry implements AutoCloseable {
      * 但批次 3 要把它塞回对话时就会拿到 null —— 而那正是「工具被拒绝了，
      * 模型却什么也看不到」这种最难查的形态（轨迹里有记录，模型侧是空的）。
      * 更糟的是：被拒绝的参数里可能带着敏感原文，绕过整形就等于绕过脱敏。
+     *
+     * @param acceptedArguments 落 {@code ai_tool_execution.arguments} 的那一份，
+     *                          取值规则见 {@link ToolResult#arguments()}
      */
-    private ToolResult finish(ToolResult result, long startNanos) {
-        ToolResult timed = result.withElapsed(elapsedMillis(startNanos));
+    private ToolResult finish(ToolResult result, long startNanos, Map<String, Object> acceptedArguments) {
+        ToolResult withArgs = result.withArguments(acceptedArguments);
+        ToolResult timed = withArgs.withElapsed(elapsedMillis(startNanos));
         ResultShaper.Shaped shaped = shaper.shape(timed);
         ToolResult finalResult = timed.withShaped(shaped.data(), shaped.truncated(),
                 shaped.notes(), shaped.text());
