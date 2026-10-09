@@ -159,6 +159,29 @@ CREATE TABLE IF NOT EXISTS `seckill_outbox`
   COLLATE = utf8mb4_0900_ai_ci;
 
 -- ---------------------------------------------------------------------------
+-- 压测影子表
+--   解决的问题：对照实验需要「同一行热点上比较条件 UPDATE 与乐观锁 version CAS
+--   两种并发模型」，但它不该为此改动生产表 stock 的结构（不必给 stock 加 version 列）。
+--   因此用一张独立的影子表承载实验，业务表保持干净。
+--
+--   【为什么现在才补进本文件】这张表原先是在本机手工建的，从未写进 schema.sql。
+--   后果在容器化之后才会暴露：新数据卷初始化的库里没有它，而
+--   seckill.bench.enabled=true 时 BenchStockMapper 会直接报「表不存在」，
+--   报错信息指向 SQL 而不是指向「schema.sql 漏了建表」——
+--   是一个会让人先怀疑 MyBatis 映射的误导性症状。
+--   count 用 BIGINT 而不是 INT：它是压测用的计数器，会被反复加减，不需要和 stock 对齐语义。
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `bench_stock`
+(
+    `id`      BIGINT NOT NULL,
+    `count`   BIGINT NOT NULL,
+    `version` BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (`id`)
+) ENGINE = InnoDB
+  DEFAULT CHARSET = utf8mb4
+  COLLATE = utf8mb4_0900_ai_ci;
+
+-- ---------------------------------------------------------------------------
 -- 初始化商品（已存在则只更新名称，不覆盖库存）
 -- ---------------------------------------------------------------------------
 INSERT INTO `stock` (`id`, `name`, `count`)

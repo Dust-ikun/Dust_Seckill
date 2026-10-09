@@ -134,6 +134,35 @@ public class StockReconcileService {
         return reconcile(stockId, AUTO_IN_FLIGHT, repair);
     }
 
+    /**
+     * 只读巡检：判定口径与 {@link #reconcile(Long, boolean)} 完全一致，但<b>没有任何副作用</b>。
+     *
+     * <h2>为什么必须有这个方法，而不是让调用方传 {@code repair=false}</h2>
+     * <p>
+     * {@code repair=false} 只关掉了「改写数据」，它还留下两处副作用：
+     * <ol>
+     *   <li><b>计数</b>：{@code status != CONSISTENT} 时会
+     *       {@code metrics.onReconcileFinding(status)}，而告警
+     *       {@code ReconcileInconsistencyDetected} 的表达式正是
+     *       {@code rate(seckill_reconcile_findings_total[10m]) > 0}。
+     *       若 AI 监控的 Business Tool 走的是 reconcile，就会形成一条闭环：
+     *       <b>告警 → Agent 调查 → 调用对账 → 计数增加 → 同一条告警再次触发 → 再调查一次</b>。
+     *       它不会自己停下来，且每一圈都要付费。</li>
+     *   <li><b>日志</b>：不一致时会落一条 ERROR。日志环形缓冲是 Logs Tool 的证据来源，
+     *       于是「Agent 读过一次」这个事实会污染它下一次读到的证据 ——
+     *       同一个问题看起来发生了两次，而其中一次是自己造成的。</li>
+     * </ol>
+     * 这两处副作用对「人点一次 /seckill/reconcile」都无害甚至有益（人要看到结论、要留下痕迹），
+     * 但被自动化调用时就变成了自激。因此这里把差异做成两条显式入口，
+     * 而不是给 {@code reconcile} 再加一个布尔参数 —— 那种写法会让调用点看不出自己在改变系统行为。
+     *
+     * @param stockId 活动 ID
+     * @return 与 reconcile(...,false) 相同的判定结果；{@code actions} 恒为空列表
+     */
+    public ReconcileReport inspect(Long stockId) {
+        return doReconcile(stockId, AUTO_IN_FLIGHT, false, false);
+    }
+
     /** expectedInFlight 的哨兵值：负值表示「在途数由数据库自动计算」（AUTO 模式） */
     public static final long AUTO_IN_FLIGHT = -1L;
 
@@ -149,6 +178,20 @@ public class StockReconcileService {
      * @return 对账报告，其中的数值字段是<b>修复前</b>的快照
      */
     public ReconcileReport reconcile(Long stockId, long expectedInFlight, boolean repair) {
+        return doReconcile(stockId, expectedInFlight, repair, true);
+    }
+
+    /**
+     * 对账的实现主体。
+     *
+     * @param recordFindings 是否把「发现不一致」这件事写进指标与 ERROR 日志。
+     *                       {@code true} = 人工/定时触发的对账（要留下痕迹，人要看得见）；
+     *                       {@code false} = 只读巡检（见 {@link #inspect}，绝不能自激）。
+     *                       注意它<b>不</b>影响是否修改数据 —— 那个由 {@code repair} 单独控制，
+     *                       两者是正交的两件事：可以「改数据但不记指标」，也可以「不改数据但记指标」。
+     */
+    private ReconcileReport doReconcile(Long stockId, long expectedInFlight, boolean repair,
+                                        boolean recordFindings) {
         boolean autoInFlight = expectedInFlight < 0;
         LocalDateTime staleCutoff = LocalDateTime.now().minusMinutes(stalePendingMinutes);
 
@@ -270,15 +313,21 @@ public class StockReconcileService {
             log.info("[对账] stockId={} 一致。Redis={}, DB={}, 可信在途={}", stockId, redisStock, dbStock, inFlight);
         } else if (repaired) {
             log.warn("[对账] stockId={} 发现 {} 并已修复：{}", stockId, status, actions);
-        } else {
+        } else if (recordFindings) {
             // 不是「一致」就落一条计数（带结论标签）：日志会滚，指标不会 —— 告警规则可以直接写
             // rate(seckill_reconcile_findings_total{status="STALE_PENDING"}[5m]) > 0
             log.error("[对账] stockId={} 发现不一致 {}，未自动修复。Redis库存={}, 应有={}, Redis标记={}, "
                             + "DB订单={}, PENDING={}, 已放弃未了结={}, 陈旧未了结={}, 未了结归还义务={}",
                     stockId, status, redisStock, expectedRedisStock, redisBoughtCount, dbOrderCount,
                     pendingOrders, abandonedPending, stalePending, unresolvedCompensations);
+        } else {
+            // 【只读巡检走这里，级别是 DEBUG】理由见 inspect() 的注释：环形缓冲的最低入缓冲级别是
+            // INFO，因此 DEBUG 不会污染 Logs Tool 的证据。巡检这件事本身由 ai_tool_execution
+            // 轨迹记录，那才是它该待的地方。
+            log.debug("[对账·巡检] stockId={} 结论 {}。Redis={}, 应有={}, PENDING={}",
+                    stockId, status, redisStock, expectedRedisStock, pendingOrders);
         }
-        if (status != ReconcileReport.Status.CONSISTENT) {
+        if (recordFindings && status != ReconcileReport.Status.CONSISTENT) {
             metrics.onReconcileFinding(status);
         }
         return report;

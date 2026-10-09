@@ -1,0 +1,157 @@
+# =============================================================================
+#  Alertmanager 配置
+#
+#  职责边界（很重要，决定了这里该写什么、不该写什么）：
+#    Alertmanager 做的是「通知语义」的收敛 —— 同一条告警的重复投递、
+#    一组相关告警的一次性通知、以及故障恢复时的 resolved 通知。
+#    SPEC 第 16 节要求的「Incident 聚合」（同服务 + 同异常类型 + 时间窗口内
+#    合并为一次诊断任务）**不在这里做**，因为那是「诊断任务语义」：
+#    它决定要不要花钱调 LLM，而不只是决定要不要发一条消息。
+#    两者必须分开，否则「降噪」会被错误地实现成「少收集证据」。
+# =============================================================================
+
+global:
+  # 若某条告警在 5 分钟内没有被重新确认，视为已恢复。
+  # 这个值必须 > Prometheus 的 evaluation_interval(15s) 数倍，
+  # 否则一次抓取抖动就会制造出「恢复 → 又告警」的假震荡。
+  resolve_timeout: 5m
+
+# =============================================================================
+#  路由树
+#
+#  【为什么按 alertname 分组，而不是按 service】
+#  按 service 分组会让「MySQL 故障」引发的 P99、错误率、超时三类告警合并成
+#  一次通知 —— 但 AI Monitor 需要知道这三类都发生了，才能判断「是同一个根因」。
+#  把它们合并掉，等于在 Agent 看到之前就替它下了结论。
+#  因此这里只按 alertname 做最小合并（同一条规则的多次触发），
+#  跨规则的关联交给 Agent 与其上游的 Incident Aggregator。
+# =============================================================================
+route:
+  # group_by 里加上 service：同一个规则在不同服务上触发时应当分开通知
+  group_by: ["alertname", "service", "severity"]
+  # 首次告警立即发，不等 group_wait 攒批 —— 诊断的时效性比少发一条消息重要
+  group_wait: 0s
+  # 同一组告警在 30s 内不再重复发（防止规则抖动刷屏）
+  group_interval: 30s
+  # 未恢复的告警每 30 分钟重发一次，避免「没人看到就一直沉默」
+  repeat_interval: 30m
+  receiver: ai-monitor-webhook
+
+  routes:
+    # -------------------------------------------------------------------------
+    # 自监控告警单独走一条路：它们描述的是「监控系统自己坏了」，
+    # 而不是「业务坏了」。把它送给 AI Monitor 是错的 ——
+    # Agent 会去查业务指标、发现一切正常，然后产出一份「未发现异常」的诊断，
+    # 反而掩盖了真正的问题（Prometheus 抓不到目标）。
+    # -------------------------------------------------------------------------
+    - matchers:
+        - alertname =~ "Prometheus.*|Alertmanager.*|TargetDown"
+      receiver: ops-console
+      group_wait: 0s
+      repeat_interval: 1h
+
+# =============================================================================
+#  接收器
+# =============================================================================
+receivers:
+
+  # ---------------------------------------------------------------------------
+  # AI Monitor API（SPEC 第 15 节的触发链路终点）
+  #
+  # `http://host.docker.internal:8081/api/ai/alerts` 是本项目后端将提供的端点：
+  # 接收 Alertmanager 的 webhook 格式，转换为内部 AlertEvent，
+  # 经 Incident 聚合后创建诊断任务。
+  #
+  # 【send_resolved: true 的意义】故障恢复时 Alertmanager 会再发一次
+  # status=resolved 的通知。Agent 据此把 Incident 标记为已结束，
+  # 而不是留下一个永远"进行中"的告警 —— 这直接决定了 Dashboard 上
+  # 「当前告警数」这个指标可不可信。
+  #
+  # 【为什么没有配任何重试之外的兜底】AI Monitor 不可达时，Alertmanager
+  # 会在日志里报投递失败，而 Prometheus / Grafana 的告警本身照常工作。
+  # 这正是 SPEC 第 5.2 节「LLM 挂掉、交易系统正常运行、普通 Prometheus 告警仍然有效」
+  # 那条约束的落点：AI 是增强，不是必需。
+  # ---------------------------------------------------------------------------
+  - name: ai-monitor-webhook
+    webhook_configs:
+      - url: "http://host.docker.internal:8081/api/ai/alerts"
+        send_resolved: true
+        # 单次投递超时。设 5s 而不是默认 10s：
+        # 这是一个「接收并立即返回 202」的端点，它不该慢；
+        # 若它慢了，让 Alertmanager 快速失败并重试，比让告警卡在队列里更好。
+        http_config:
+          follow_redirects: false
+        max_alerts: 0   # 0 = 不限制单次投递的告警条数（由 group_by 控制规模）
+
+  # ---------------------------------------------------------------------------
+  # 运维控制台（自监控告警的出口）
+  #
+  # 这里只需要「让人看见」，因此用一个必然可用的出口。
+  # 生产环境应当替换为真实的 IM / 短信通道 —— 那属于部署环境的事，
+  # 不属于本项目仓库该硬编码的内容。
+  # ---------------------------------------------------------------------------
+  - name: ops-console
+    webhook_configs:
+      # Alertmanager 内置的 null receiver 语义：投递到一个必然失败但会被记录下来的地址，
+      # 使告警出现在 Alertmanager UI（localhost:9093）里而不真的发出去。
+      # 【为什么这样写而不是用 `receivers: [{name: ops-console}]` 空接收器】
+      # 空接收器不会在 Alertmanager 的 UI 上留下「已通知」记录，
+      # 排查「为什么我没收到告警」时会少一条关键证据。
+      - url: "http://127.0.0.1:9/alert-sink"
+        send_resolved: true
+
+# =============================================================================
+#  抑制规则
+#
+#  【为什么需要抑制】一次 MySQL 故障会同时触发：P99 高、错误率高、慢查询激增。
+#  若三条都发出去，Agent 会被启动多次（除非 Incident 聚合生效），而人也会被刷屏。
+#  抑制规则做的是「我知道这是同一件事」的最廉价表达。
+#
+#  【抑制不会让告警消失，只是不通知】
+#  这一点必须说清楚，因为它决定了下游能不能正常工作：
+#  被抑制的告警仍然存在于 Prometheus 的 `ALERTS` 序列里（只是 `alertstate`
+#  变成 suppressed），Agent 通过 Metrics Tool 查询时依然能看到全部指标与全部告警。
+#  这就是为什么「降噪」与「少收集证据」是两件必须分开的事。
+#
+#  【每条 source 引用的告警名都必须真实存在】
+#  引用一个不存在的告警名，抑制规则会**静默失效** —— 不报错、不留痕，
+#  只是那条抑制永远不生效。monitoring/validate_config.py 专门检查这一点。
+# =============================================================================
+inhibit_rules:
+
+  # 应用整体不可达时，抑制它的所有下游症状告警。
+  #
+  # 理由很直接：应用都连不上了，P99 / 错误率 / 慢查询这三类"症状"要么同时
+  # 一起报，要么（更常见）因为指标序列干脆不存在而根本不触发。
+  # 保留一条 ServiceDown 就足以说明问题，附带的三条只会稀释注意力。
+  - source_matchers:
+      - alertname = "ServiceDown"
+    target_matchers:
+      - alertname =~ "ApiP99LatencyHigh|ApiErrorRateHigh|ApiSlowRequestRateHigh|SlowQuerySurge"
+    equal: ["service"]
+
+  # 数据库连接池打满时，抑制「慢查询激增」—— 池满时请求在等连接，
+  # 根本还没走到 SQL 执行，慢查询日志不会更新。此时两条一起报会把
+  # 「连接池配置问题」误读成「SQL 性能问题」。
+  - source_matchers:
+      - alertname = "DbConnectionPoolExhausted"
+    target_matchers:
+      - alertname = "SlowQuerySurge"
+    equal: ["service"]
+
+  # Redis 触发降级时，抑制「慢请求占比高」—— 降级本身已经明确指出了原因，
+  # 慢请求是它的必然结果。此时应当直接去看 RedisDegradationTriggered 的描述。
+  - source_matchers:
+      - alertname = "RedisDegradationTriggered"
+    target_matchers:
+      - alertname = "ApiSlowRequestRateHigh"
+    equal: ["service"]
+
+  # 消费堆积（MqConsumeLagGrowing）会必然导致 Outbox 待投递上升
+  # （投递出去的消息没人消费，投递器仍在按 batch-size 继续投），
+  # 因此堆积告警成立时抑制欠账告警：前者是原因，后者是结果。
+  - source_matchers:
+      - alertname = "MqConsumeLagGrowing"
+    target_matchers:
+      - alertname = "OutboxBacklogHigh"
+    equal: ["service"]

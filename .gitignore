@@ -42,6 +42,23 @@ draft_*/
 ### 本地文档与压测产物，不纳入版本控制 ###
 docs/
 jmeter.log
+
+### 压测目录：整体不纳入版本控制 ###
+# 为什么用目录级规则而不是逐类文件规则：
+#   loadtest/ 约 80MB，且内容会随每次压测持续增长（.jtl 原始样本、应用日志、
+#   JMeter HTML 报告）。逐条列举后缀（*.jtl / app*.log / dashboard4/）总有漏项，
+#   而漏项的后果是 80MB 二进制进了仓库 —— 这类错误一旦 push 就很难清理。
+#   目录级规则是"默认拒绝"，新产生的压测产物自动被挡住，不需要每次补规则。
+#   （配套约定：压测脚本与结论请写进 docs/ 或 loadtest/README.md，
+#     需要长期保留的内容不要留在 loadtest/ 里。）
+loadtest/
 *.log
 
 src/main/resources/application.yaml
+
+### Docker Compose 本地环境变量 ###
+# .env 由 .env.example 复制而来，里面可能有本机口令与端口调整。
+# 必须忽略：docker-compose.yml 默认读它，一旦提交就等于把口令一起提交了。
+# .env.example 是模板，必须保留在版本控制里。
+.env
+.env.local

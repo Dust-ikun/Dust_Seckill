@@ -1,0 +1,758 @@
+{
+  "uid": "seckill-incident-detail",
+  "title": "2. 异常详情",
+  "description": "SPEC 第 20 节页面 2。从「系统在哪儿慢」下钻到「是谁引起的、影响多大」。",
+  "tags": [
+    "seckill",
+    "incident"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "graphTooltip": 1,
+  "refresh": "10s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "annotations": {
+    "list": [
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "seckill-prometheus"
+        },
+        "enable": true,
+        "hide": false,
+        "iconColor": "rgba(255, 96, 96, 1)",
+        "name": "告警触发",
+        "target": {
+          "expr": "ALERTS{alertstate=\"firing\"}",
+          "refId": "Anno"
+        }
+      }
+    ]
+  },
+  "templating": {
+    "list": []
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "这一页要回答什么",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 7
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**异常详情页**：从「系统在哪儿慢」下钻到「是谁引起的、影响多大」。\n\n下钻顺序（与 SPEC 第 20 节一致）：\n`异常信息 → 指标趋势 → 根因 → 证据 → 影响范围 → 修复建议`\n\n**前两块（异常信息、指标趋势）由本页的 Prometheus 面板直接给出；**\n**后四块由 AI Monitor Agent 产出**，本页底部给出了它们的查询入口。\n刻意不在这里伪造静态文本 —— 诊断结论必须来自 Agent 对真实数据的推理。"
+      },
+      "transparent": false
+    },
+    {
+      "id": 2,
+      "type": "row",
+      "title": "一、异常信息（发生了什么）",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 7,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 3,
+      "type": "table",
+      "title": "当前 firing 的告警",
+      "description": "把 status/db/redis/mq/outbox/business 六个维度分别看清楚。**关键判据**：同一个时间窗内是否有多个维度同时异常 ——那通常意味着一个共享依赖（最常见是 MySQL）而不是多个独立故障。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "seckill-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 12,
+        "h": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false
+        }
+      },
+      "transformations": [],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "seckill-prometheus"
+          },
+          "expr": "ALERTS{alertstate=\"firing\"}",
+          "format": "table",
+          "instant": true,
+          "range": false
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "P99 延迟（按接口）",
+      "description": "若只有某一个 uri 慢 → 大概率是该接口的查询/SQL 问题；若所有 uri 一起慢 → 大概率是共享资源（DB 连接池、Redis、线程池）。这个区分决定了 Agent 下一步该调哪个 Tool。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "seckill-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 12,
+        "h": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "seckill-prometheus"
+          },
+          "expr": "seckill:http_p99_latency:5m",
+          "legendFormat": "{{uri}} / {{status}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "row",
+      "title": "二、指标趋势（横向对比各个嫌疑人）",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 17,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "① MySQL：慢请求（>1s）速率",
+      "description": "Case 1（MySQL 慢 SQL）的特征信号。注意它是**近似**指标 —— 精确的慢 SQL 明细来自 DB Tool 的 get_slow_sql()，后者读 MySQL 的 performance_schema。指标用于发现，工具用于取证。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "seckill-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 18,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "seckill-prometheus"
+          },
+          "expr": "sum(rate(http_server_requests_seconds_count{uri=\"/seckill\"}[5m])) - sum(rate(http_server_requests_seconds_bucket{uri=\"/seckill\",le=\"1.0\"}[5m]))",
+          "legendFormat": "慢请求/秒",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "② Redis：命令 P99",
+      "description": "Case 2（Redis 延迟）的特征信号。若 Redis P99 与 API P99 同步抬升、而 MySQL 侧无异常 → 根因在 Redis。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "seckill-prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 18,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.05
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "seckill-prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(lettuce_seconds_bucket[5m])))",
+          "legendFormat": "Redis P99",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "③ MQ：在途净增长速率",
+      "description": "Case 3（消费变慢）的特征信号。持续为正 = 堆积在扩大。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "seckill-prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 18,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "seckill-prometheus"
+          },
+          "expr": "sum(rate(seckill_mq_sent_total[5m])) - sum(rate(seckill_consume_confirmed_total[5m])) - sum(rate(seckill_consume_duplicate_total[5m])) - sum(rate(seckill_consume_order_missing_total[5m])) - sum(rate(seckill_consume_failed_total[5m]))",
+          "legendFormat": "在途增长/秒",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "④ Outbox：待投递存量",
+      "description": "Case 4（Outbox 积压）的特征信号。**关键判据**：它涨的同时 `seckill_mq_send_failed_total` 涨不涨？涨 → Broker 可达性问题；不涨 → 投递器本身（调度阻塞 / 批量发送整体超时）。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "seckill-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 26,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1000
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "seckill-prometheus"
+          },
+          "expr": "max(seckill_outbox_pending) by (service)",
+          "legendFormat": "待投递",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "⑤ 投递失败速率（与④对照读）",
+      "description": "与 Outbox 存量对照，区分「Broker 不可达」与「投递器自身卡住」。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "seckill-prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 26,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "seckill-prometheus"
+          },
+          "expr": "sum(rate(seckill_mq_send_failed_total[5m]))",
+          "legendFormat": "投递失败/秒",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "⑥ 业务：订单成功率",
+      "description": "**影响范围**的核心证据。技术指标异常但成功率未降 → 影响可控；成功率同步下降 → 已经影响用户，严重度上升。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "seckill-prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 26,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 0.99
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "seckill-prometheus"
+          },
+          "expr": "seckill:order_success_rate:5m",
+          "legendFormat": "成功率",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "row",
+      "title": "三、根因与证据（由 AI Monitor Agent 产出）",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 34,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 13,
+      "type": "table",
+      "title": "数据一致性：对账结论",
+      "description": "Case 5（Redis / MySQL 不一致）的特征信号。status 标签本身就是重要证据：REDIS_AHEAD 说明有扣减绕过了 Redis（降级写库），STALE_PENDING / ABANDONED_PENDING 说明有预订单不会自己走向终态。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "seckill-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 35,
+        "w": 12,
+        "h": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false
+        }
+      },
+      "transformations": [],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "seckill-prometheus"
+          },
+          "expr": "sum by (status) (rate(seckill_reconcile_findings_total[10m])) > 0",
+          "format": "table",
+          "instant": true,
+          "range": false
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "table",
+      "title": "需人工介入的欠账明细",
+      "description": "终态失败的存量。它们**不会自愈**，且直接对应「少卖」这个业务损失。Agent 给出的建议应当是「调用 /seckill/reconcile 查看对账结论」，而**不是**直接修改数据（SPEC 第 19 节 Case 5 的明确要求）。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "seckill-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 35,
+        "w": 12,
+        "h": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false
+        }
+      },
+      "transformations": [],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "seckill-prometheus"
+          },
+          "expr": "seckill_outbox_failed or seckill_compensate_pending",
+          "format": "table",
+          "instant": true,
+          "range": false
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "text",
+      "title": "Agent 诊断结果的查询入口",
+      "gridPos": {
+        "x": 0,
+        "y": 44,
+        "w": 24,
+        "h": 12
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "根因、证据、影响范围、修复建议这四块**不在这里硬编码**，它们由 AI Monitor Agent 基于本次异常的实际数据推理产出。获取方式：\n\n| 用途 | 接口 |\n|---|---|\n| 触发一次诊断 | `POST /api/ai/diagnosis` |\n| 查诊断结果（根因/证据/影响/建议） | `GET /api/ai/diagnosis/{incidentId}` |\n| 查 Tool Calling 完整轨迹 | `GET /api/ai/diagnosis/{incidentId}/tools` |\n| 查历史诊断 | `GET /api/ai/diagnosis/history` |\n\n**为什么把它们放在接口而不是看板上**：诊断结论是「一次推理的产物」，它带时间戳、带证据引用、带置信度，是一份**记录**而不是一条**时间序列**。硬塞进 Grafana 只能做成静态文本，反而会让人误以为它是实时结论。\n\n完整链路（含 Agent 的每一步 Tool 调用）见 **页面 3：Agent 执行链路**。"
+      },
+      "transparent": false
+    }
+  ]
+}

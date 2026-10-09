@@ -1,0 +1,142 @@
+# =============================================================================
+#  Prometheus 采集配置
+#
+#  【采集周期 15s 是怎么定的】SPEC 第 25 节要求「Metrics 采集周期：15s」。
+#  这个值与两件事必须对齐，否则会静默出错：
+#   1) 应用侧 Gauge 的刷新间隔是 30s（seckill.metrics.gauge-refresh-ms）。
+#      抓取比刷新快只意味着会抓到两次相同的值 —— 无害；
+#      反过来（抓取比刷新慢）会让曲线出现锯齿，rate() 会算出假的抖动。
+#   2) 告警规则里的 `for: 30s` 必须 > 采集周期，否则一次告警需要两个样本点
+#      才能成立的条件永远无法满足（Prometheus 的 pending 状态需要至少两次求值）。
+#
+#  【job 命名与 SPEC 的对齐】SPEC 的 AlertEvent 里有 serviceName 字段，
+#  这里的 job 名就是它的来源。刻意取 order-service 而不是 Dust-ikun_seckill：
+#  前者是「这个服务在链路里承担什么角色」，后者是「这个仓库叫什么」。
+#  故障诊断时前者才有信息量 —— 而且它与 SPEC 的示例 JSON 完全一致。
+# =============================================================================
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+  # 所有时间序列自动带上这两个标签：出问题时能立刻分辨「哪台机器、哪次部署」
+  external_labels:
+    env: local
+    stack: seckill
+
+# =============================================================================
+#  采集目标
+# =============================================================================
+scrape_configs:
+
+  # ---------------------------------------------------------------------------
+  # 业务应用（Spring Boot + Micrometer）
+  #
+  # 【为什么目标是 9091 而不是 8081】本项目刻意把 actuator 拆到独立管理端口，
+  # 且只绑 127.0.0.1（见 application.yaml 的注释）：
+  # 「业务端口对外提供秒杀能力」与「运维端点仅本机可达」两个目标同时成立，
+  # 不需要引入 Spring Security。
+  #
+  # Prometheus 在容器里，所以要经 host.docker.internal 访问宿主机的 127.0.0.1。
+  # 这意味着宿主机上必须允许来自 Docker 网桥的连接 —— 由于 actuator 只绑回环，
+  # 容器是连不上的。因此应用侧需要一个额外的开关：
+  # 用 `--spring.profiles.active=docker` 启动时，management.server.address 会被
+  # 放开为 0.0.0.0（见 application-docker.yaml）。
+  # 这是本方案里唯一一处「为了让容器能抓到指标而放宽监听地址」的取舍，
+  # 换来的是不必给 Prometheus 装 host 网络模式。
+  # ---------------------------------------------------------------------------
+  - job_name: order-service
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["host.docker.internal:9091"]
+        labels:
+          service: order-service
+          instance_type: host-process
+
+  # ---------------------------------------------------------------------------
+  # Prometheus 自身
+  #
+  # 采集自己是必要的：告警规则依赖 `up` 与 `ALERTS`，而这两个指标如果只存在于
+  # 「采集目标」里，就会出现「Prometheus 自己挂了却没人告警」的盲区。
+  # ---------------------------------------------------------------------------
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+        labels:
+          service: prometheus
+
+  # ---------------------------------------------------------------------------
+  # Alertmanager 自身
+  # ---------------------------------------------------------------------------
+  - job_name: alertmanager
+    static_configs:
+      - targets: ["alertmanager:9093"]
+        labels:
+          service: alertmanager
+
+  # ---------------------------------------------------------------------------
+  # RocketMQ Broker（内置 Prometheus 导出器）
+  #
+  # 【为什么 MQ 指标必须从 Broker 侧取，而不只用应用侧计数】
+  # 应用侧的 seckill_mq_sent_total / seckill_consume_confirmed_total 都是
+  # **单实例进程内计数**（见 SeckillMetrics 的类注释）。它们能回答
+  # 「我这个实例投了多少、确认了多少」，但回答不了「队列里还堆着多少没被消费」——
+  # 后者才是 SPEC 里 mq_lag 的定义，也是判断「消费者是不是落后了」的唯一直接证据。
+  # 队列水位只存在于 Broker 的存储与消费位点里。
+  #
+  # 【为什么不是 JMX Exporter（这是可行性报告 §3.1 冲突 3 的修正）】
+  # 原方案是「挂 jmx_prometheus_javaagent 读 Broker 的 MBean」。实测证明这条路
+  # 在 RocketMQ 5.x 上不存在：
+  #     jar tf rocketmq-broker-5.3.2.jar | grep -ci mbean   → 0
+  #     启动本地管理代理后枚举平台 MBeanServer → 只有 23 个 JDK 自带的 ObjectName，
+  #                                              没有任何 org.apache.rocketmq
+  #     find / -iname '*jmx*'                              → 镜像里没有那个 agent jar
+  # RocketMQ 5.x 已把监控换成 OpenTelemetry，MBean 是 4.x 的形态。
+  # 因此改用 Broker **内置**的 Prometheus 导出器（metricsExporterType=PROM），
+  # 零新增依赖、零新增容器，而且给出的就是精确的消费堆积。
+  #
+  # 【它与 order-service 那个 job 的目标写法**故意不同**，这不是笔误】
+  #     order-service  跑在宿主机  → Prometheus 必须经 host.docker.internal 访问
+  #     rocketmq-broker 跑在容器里 → Prometheus 直接走 compose 网络访问服务名
+  # 两者互换的后果都是「目标长期 DOWN」：前者会连到容器自己的 127.0.0.1，
+  # 后者会绕到宿主机的 5557（那里只是端口转发，且只绑了回环）。
+  #
+  # 【指标名的实际形态】OTel 的 Prometheus 导出器不加 instrumentation scope 前缀，
+  # 因此暴露出来的就是 RocketMQ 的原始名字。验证方式：
+  #     curl -s http://localhost:5557/metrics | grep rocketmq_consumer_lag
+  # 关键几条：rocketmq_consumer_lag_messages（队列堆积，即 mq_lag 的精确值）、
+  #           rocketmq_consumer_lag_latency / _inflight_messages / _ready_messages、
+  #           rocketmq_messages_in_total / _out_total、rocketmq_send_to_dlq_messages_total
+  # 一律带 cluster / node_type=broker / topic / consumer_group 标签，可按 topic 下钻。
+  #
+  # 【为什么 labels 里要加 instance_type】与 order-service 的标签保持同一套口径，
+  # 这样看板上的模板变量可以跨 job 复用（按 instance_type 区分「宿主机进程」与「容器」）。
+  # ---------------------------------------------------------------------------
+  - job_name: rocketmq-broker
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["rocketmq-broker:5557"]
+        labels:
+          service: rocketmq-broker
+          instance_type: container
+
+# =============================================================================
+#  告警规则装载
+#
+#  规则放在独立目录下按主题分文件（rules/*.yml），而不是全塞进本文件：
+#  prometheus.yml 是「采集什么」的声明，rules 是「什么算异常」的判断，
+#  两者变更频率完全不同 —— 调阈值不应该动到采集配置。
+# =============================================================================
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+# =============================================================================
+#  告警投递：交给 Alertmanager 做分组、抑制与（最终）webhook 通知
+#
+#  这里不直接写 webhook 到 AI Monitor 的原因见 docker-compose.yml 里
+#  alertmanager 服务的注释（分组语义与 resolved 通知）。
+# =============================================================================
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]

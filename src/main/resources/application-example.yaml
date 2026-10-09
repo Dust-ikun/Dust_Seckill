@@ -25,6 +25,52 @@ spring:
           max-idle: 50
           min-idle: 10
           max-wait: 1000ms
+
+# ----------------------------------------------------------------------------
+# 运维端点与指标口径（与 application.yaml 保持一致，这份示例也需要）
+#
+# 【为什么直方图必须显式打开】Micrometer 默认只暴露 count / sum / max，
+# 没有 histogram buckets 就没有 `le` 标签，于是
+# histogram_quantile(0.99, ... http_server_requests_seconds_bucket) 查不到序列。
+# 后果不是「P99 显示为 0」，而是 **P99 告警永远不会响**（规则停在 inactive，
+# 不报错、不留痕）。实测过：漏配这一段会让
+# ApiP99LatencyHigh / ApiSlowRequestRateHigh / SlowQuerySurge 三条告警全部静默失效。
+#
+# 【slo 里为什么必须显式写 1s】Micrometer 自动生成的是 1.048576×2ⁿ 那一族桶，
+# **不含 1.0**（相邻边界是 0.984263336 与 1.073741824）。而记录规则
+# seckill:http_slow_request_rate:5m 与告警 SlowQuerySurge 直接读 `le="1.0"`，
+# 不显式声明就依然没有数据。
+#
+# 【lettuce 的仪表名】Redis 命令耗时来自 Spring Data Redis 的 Observation，
+# 注册名是 `lettuce` / `lettuce.active`，标签是 db_operation ——
+# 不是 lettuce.command.completion，写错名字同样匹配不到任何仪表。
+# ----------------------------------------------------------------------------
+management:
+  server:
+    port: 9091
+    # 只绑回环：业务端口对外、运维端点仅本机可达。
+    # Prometheus 跑在容器里时要改成 0.0.0.0（见 application-docker.yaml）。
+    address: 127.0.0.1
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+        lettuce: true
+        lettuce.active: true
+      slo:
+        http.server.requests: 50ms, 100ms, 300ms, 1s, 2s
+      minimum-expected-value:
+        http.server.requests: 10ms
+      maximum-expected-value:
+        http.server.requests: 30s
+
 # ----------------------------------------------------------------------------
 # MyBatis 配置。
 #

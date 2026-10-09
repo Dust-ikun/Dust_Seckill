@@ -1,0 +1,50 @@
+# =============================================================================
+#  Grafana 看板自动装载
+#
+#  【为什么用「文件提供者」而不是「把 JSON 存进 Grafana 数据库」】
+#  以文件为源时，看板变更可以进 Git、可以 review、可以回滚。
+#  存在数据库里则只有「谁在 UI 上点了什么」这一种历史，而这是本项目的
+#  面试演示场景中最不希望出现的情况：改坏一个面板之后无法 diff、无法还原。
+#
+#  allowUiUpdates: false 是刻意的 ——
+#  允许 UI 修改会让文件与数据库产生两个真相，重启后文件覆盖数据库，
+#  表现为「我明明改过了，怎么又变回去了」。
+#  正确的工作流是：在 UI 上调好面板 → Export JSON → 覆盖本目录下的文件 → 提交。
+# =============================================================================
+
+apiVersion: 1
+
+providers:
+
+  - name: seckill-dashboards
+    orgId: 1
+    # 看板在 Grafana 里的文件夹名。与 SPEC 第 20 节的三个页面一一对应。
+    folder: "秒杀监控"
+    folderUid: seckill-monitoring
+    type: file
+    disableDeletion: false     # 允许删除文件即删除看板，保持文件为唯一真相
+    allowUiUpdates: false
+    updateIntervalSeconds: 30  # 文件改动后最多 30s 自动生效，不必重启容器
+    options:
+      # 容器内路径，由 docker-compose.yml 把 ./monitoring/grafana/dashboards 挂到这里
+      path: /var/lib/grafana/dashboards
+      # -----------------------------------------------------------------------
+      # 【这里必须是 false，且这一行是踩过坑之后才定下来的】
+      #
+      # 曾经设成 true（想按子目录自动分文件夹），结果是 Grafana **启动即崩**、
+      # 无限重启，而错误信息在日志最后一行：
+      #     Error: Failed to create provisioner: Failed to initialize file readers:
+      #       failed to create file reader for config seckill-dashboards:
+      #       'folder' and 'folderUID' should be empty using
+      #       'foldersFromFilesStructure' option
+      #
+      # 原因：`foldersFromFilesStructure: true` 的含义是「文件夹结构由**磁盘目录**
+      # 决定」，因此它要求 `folder`/`folderUid` 必须为空 —— 两者同时出现是矛盾配置。
+      # 而对本项目来说，看板就是三个平铺的 JSON 文件，没有子目录可依据；
+      # 显式指定 `folder: 秒杀监控` 才是想要的效果。
+      #
+      # 教训：这个配置的失败方式是「容器反复重启 + 真因藏在日志末尾」，
+      # 而 compose 里只有 healthcheck 状态，看不出原因。所以这条注释留在这里，
+      # 避免以后有人又想当然地把它改成 true。
+      # -----------------------------------------------------------------------
+      foldersFromFilesStructure: false

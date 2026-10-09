@@ -9,16 +9,19 @@ import com.dustikun.seckill.Service.SeckillPersistenceService;
 import com.dustikun.seckill.Service.SeckillPersistenceService.CancelOutcome;
 import com.dustikun.seckill.Service.SeckillPersistenceService.ConfirmOutcome;
 import com.dustikun.seckill.Service.StockCacheService;
+import com.dustikun.seckill.monitor.core.TraceContext;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.rocketmq.client.consumer.listener.ConsumeConcurrentlyContext;
 import org.apache.rocketmq.client.consumer.listener.ConsumeConcurrentlyStatus;
 import org.apache.rocketmq.client.consumer.listener.MessageListenerConcurrently;
+import org.apache.rocketmq.common.message.MessageConst;
 import org.apache.rocketmq.common.message.MessageExt;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 import tools.jackson.databind.ObjectMapper;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * 秒杀订单消费者：把「确认订单 + 扣库存」从请求线程搬到独立线程池。
@@ -95,6 +98,54 @@ public class SeckillOrderConsumer implements MessageListenerConcurrently {
             return ConsumeConcurrentlyStatus.CONSUME_SUCCESS;
         }
 
+        // ------------------------------------------------------------------
+        // 【为什么必须在这里开一个 tracing 作用域】
+        //
+        // MDC 底层是 ThreadLocal，它<b>不会</b>从请求线程传播到消费线程。没有这一段时：
+        //   · 消费侧所有日志的 traceId 为空（或更糟：残留着上一条消息的值，
+        //     因为 ConsumeMessageConcurrentlyService 的线程池会复用线程）；
+        //   · 于是「一次下单的建单日志」与「它被消费的日志」无法用同一个值串起来，
+        //     而 SPEC 第 12 节的诊断流程恰恰要求跨这两段取证。
+        //
+        // 作用域用 try-with-resources 包住<b>整条消费路径</b>（含 handleFailure），
+        // 因为失败路径的日志才是最需要 traceId 的那些。
+        // ------------------------------------------------------------------
+        try (TraceContext.Scope ignored = TraceContext.open(
+                resolveTraceId(messageExt, message), "consumeOne",
+                Map.of(TraceContext.ORDER_NO, String.valueOf(message.orderNo()),
+                        TraceContext.STOCK_ID, String.valueOf(message.stockId())))) {
+            return doConsume(messageExt, message);
+        }
+    }
+
+    /**
+     * 解析这条消息的追踪标识。
+     *
+     * <p><b>三级来源，按可靠性排序</b>：
+     * <ol>
+     *   <li><b>RocketMQ 的 {@code KEYS} 属性</b>（生产者用 orderNo 作为消息 key 写下，
+     *       见 {@code SeckillMessageProducer#toMqMessage}）。这是 Broker 侧也能看到的字段，
+     *       因此它让「日志里的 traceId」与「Broker 控制台里的消息」对得上 ——
+     *       这是本方案能给出的最强关联。</li>
+     *   <li><b>消息体里的 orderNo</b>。它一定存在，且同样能唯一定位一次下单。</li>
+     *   <li>兜底新生成一个。走到这里说明消息体与属性都不可靠，
+     *       此时仍要给一个值 —— 空 traceId 会让后续排查误以为「这条日志不属于任何请求」。</li>
+     * </ol>
+     *
+     * <p><b>为什么加前缀而不是直接用 orderNo</b>：日志里 {@code traceId=SN175...}
+     * 会被读成「单号」而不是「追踪标识」，而两者在语义上不同（一个标识订单、
+     * 一个标识调用链）。前缀让它们一眼可辨。
+     */
+    private static String resolveTraceId(MessageExt messageExt, SeckillMessage message) {
+        String keys = messageExt.getProperty(MessageConst.PROPERTY_KEYS);
+        if (keys != null && !keys.isBlank()) {
+            return "mq-" + keys.trim();
+        }
+        return "mq-" + message.orderNo();
+    }
+
+    /** 真正的消费动作。抽出来是为了让 tracing 作用域只出现在一个地方，不容易被误删 */
+    private ConsumeConcurrentlyStatus doConsume(MessageExt messageExt, SeckillMessage message) {
         try {
             ConfirmOutcome outcome = persistenceService.confirm(
                     message.orderNo(), message.userId(), message.stockId(), message.num());

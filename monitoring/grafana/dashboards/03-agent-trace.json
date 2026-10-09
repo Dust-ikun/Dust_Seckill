@@ -1,0 +1,293 @@
+{
+  "uid": "seckill-agent-trace",
+  "title": "3. Agent 执行链路",
+  "description": "SPEC 第 20 节页面 3。展示诊断任务与 Tool Calling 轨迹，用于证明诊断基于真实数据、多轮取证、可追溯。",
+  "tags": [
+    "seckill",
+    "ai-agent"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "graphTooltip": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "annotations": {
+    "list": [
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "seckill-prometheus"
+        },
+        "enable": true,
+        "hide": false,
+        "iconColor": "rgba(255, 96, 96, 1)",
+        "name": "告警触发",
+        "target": {
+          "expr": "ALERTS{alertstate=\"firing\"}",
+          "refId": "Anno"
+        }
+      }
+    ]
+  },
+  "templating": {
+    "list": []
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "这一页要回答什么",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 8
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**Agent 执行链路页**：证明诊断不是「问了一次大模型」，而是**基于真实系统数据、多轮取证、可追溯**的过程。\n\nSPEC 第 20 节把这一页标为「特别适合面试演示」，原因是它同时展示三件事：\n1. Agent **自主选择**了哪些 Tool（而不是固定顺序跑一遍）；\n2. 每一步 Tool 调用的**真实入参与真实返回**（存在 `ai_tool_execution` 表）；\n3. 结论是**怎么从证据推出来的**（evidence 与 root_cause 的对应关系）。"
+      },
+      "transparent": false
+    },
+    {
+      "id": 2,
+      "type": "row",
+      "title": "一、诊断发生的时刻（把推理标在故障曲线上）",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "API P99 与告警触发点",
+      "description": "图上的红色注释就是 ALERTS 的触发时刻。Agent 的 Tool 调用时间窗应当紧跟在这条注释之后 ——若两者相隔很远，说明诊断任务被排在了队列里（Incident 聚合或线程池饱和），这本身就是一个值得记录的性能问题。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "seckill-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 9,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "seckill-prometheus"
+          },
+          "expr": "seckill:http_p99_latency:5m",
+          "legendFormat": "{{uri}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "证据来源的四个维度（同时抬高 = 同一根因）",
+      "description": "把「可能的证据来源」画在同一条时间轴上，是判断 Agent 结论是否可信的最直接手段：**若 Agent 说是 MySQL 的问题，但 MySQL 侧曲线全程平坦、而 Redis 降级在同步抬升，那么它的结论就是错的**。这一页的价值有一半在于让结论可被证伪。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "seckill-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 9,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "seckill-prometheus"
+          },
+          "expr": "sum(rate(seckill_request_degraded_total[5m]))",
+          "legendFormat": "Redis 降级次数/秒",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "row",
+      "title": "二、Agent 工作流（SPEC 第 8.2 节）",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 17,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 6,
+      "type": "text",
+      "title": "Tool Calling / ReAct 流程",
+      "gridPos": {
+        "x": 0,
+        "y": 18,
+        "w": 12,
+        "h": 13
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "```text\nAlert Event\n    ↓\nAgent（读取 Alert Context + System Prompt）\n    ↓\n分析当前异常 → 选择 Tool ──────────┐\n    ↑                              │\n    │                        Tool 执行（只读）\n    │                              │\n    └──── Tool Result ◀────────────┘\n         （写 ai_tool_execution）\n    ↓\n满足证据条件（≥2 个独立证据）\n    ↓\n生成结构化 Diagnosis（JSON Schema 校验）\n```\n\n**关键设计**：Agent **不强制执行固定顺序**，而是基于当前异常动态选择工具。\nSPEC 第 12 节给了一个反例：拿到「P99 高」就立刻下结论是错的 ——它必须继续查 DB、查日志、查 MQ，直到有至少两个**互相独立**的证据。"
+      },
+      "transparent": false
+    },
+    {
+      "id": 7,
+      "type": "text",
+      "title": "五个 Tool 与它们各自回答的问题",
+      "gridPos": {
+        "x": 12,
+        "y": 18,
+        "w": 12,
+        "h": 13
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "| Tool | 回答的问题 | 数据来源 |\n|---|---|---|\n| **Metrics** | 现在哪一项指标偏离了基线？ | Prometheus HTTP API |\n| **Logs** | 应用自己说了什么错误？ | 应用日志（已脱敏） |\n| **DB** | 数据库侧的实情是什么？ | MySQL performance_schema / 慢查询日志 |\n| **MQ** | 消息是不是堆住了？ | Broker 消费位点 + 应用侧计数 |\n| **Business** | 用户实际受到了什么影响？ | orders / stock / outbox / Redis |\n\n**为什么必须分成五个而不是合成一个「查一下」**：\n每个 Tool 对应一个**可以独立证伪**的假设。合成一个之后，Agent 的推理过程就变成了一次不可审计的黑盒调用，而 SPEC 第 9 节要求「根因判断至少需要两个独立证据」——「独立」这件事只能在 Tool 边界上被验证。"
+      },
+      "transparent": false
+    },
+    {
+      "id": 8,
+      "type": "row",
+      "title": "三、Tool Trace 与诊断结果（来自 ai_tool_execution / ai_diagnosis_result）",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 31,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 9,
+      "type": "text",
+      "title": "为什么 Tool Trace 是可解释性的关键",
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 24,
+        "h": 12
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "SPEC 第 14.3 节的原话：`ai_tool_execution` 是 Agent 可解释性的关键，用于**完整保存 Tool Calling Trace**。\n\n它保存的不只是「调用了哪个工具」，而是四件事：\n1. **arguments（JSON）**：Agent 当时带着什么参数去查 —— 能看出它的假设是什么；\n2. **result（JSON）**：它实际看到了什么 —— 能验证证据确实存在，而不是编的；\n3. **execution_time_ms**：每次取证花了多久 —— 对应 SPEC 第 25 节「Tool 单次调用 < 1s」；\n4. **status**：成功还是失败 —— **失败的 Tool 调用同样要留痕**。\n\n第 4 点最容易被忽略：若 Agent 因为某个 Tool 报错而转向了另一条推理路径，只记录成功的调用会让整条轨迹看起来「证据不足却下了结论」。\n把失败也记下来，轨迹才真正可复现。"
+      },
+      "transparent": false
+    },
+    {
+      "id": 10,
+      "type": "text",
+      "title": "接口清单（这一页的数据从这里来）",
+      "gridPos": {
+        "x": 0,
+        "y": 44,
+        "w": 24,
+        "h": 11
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "| 目的 | 请求 | 返回 |\n|---|---|---|\n| 创建诊断任务 | `POST /api/ai/diagnosis` | incidentId + 任务状态 |\n| 查诊断结果 | `GET /api/ai/diagnosis/{incidentId}` | root_cause / confidence / evidence / impact / suggestions |\n| 查 Tool Trace | `GET /api/ai/diagnosis/{incidentId}/tools` | 按时间排序的完整 Tool 调用序列 |\n| 查历史 | `GET /api/ai/diagnosis/history` | 历史 Incident 列表 |\n\n**演示建议**：先把本页与页面 2 并排打开，然后依次触发 SPEC 第 19 节的五个故障注入 Case，观察 Agent 在不同 Case 下**选择 Tool 的顺序不同**。这一点比任何架构图都更能说明「它不是固定流程的脚本」。"
+      },
+      "transparent": false
+    }
+  ]
+}

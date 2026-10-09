@@ -2,6 +2,7 @@ package com.dustikun.seckill.Task;
 
 import com.dustikun.seckill.Config.OutboxProperties;
 import com.dustikun.seckill.Service.OutboxService;
+import com.dustikun.seckill.monitor.core.TraceContext;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -38,10 +39,14 @@ public class OutboxDispatchTask {
      * <p>
      * 定时任务里绝不能把异常抛出去：一次执行失败会连带影响后续调度，
      * 而「投递」恰恰是最可能失败的一步（Broker 不可用），必须让它自己扛住。
+     * <p>
+     * <b>每轮开一个 tracing 作用域</b>：定时任务线程没有 HTTP 上下文，
+     * 而线程池会复用线程 —— 不开作用域时本轮日志的 traceId 会是上一轮的残留值。
+     * 一轮一个 traceId 正好对应「一次投递批次」，是按 traceId 取证的自然粒度。
      */
     @Scheduled(fixedDelayString = "${seckill.outbox.dispatch-interval-ms:1000}")
     public void dispatch() {
-        try {
+        try (TraceContext.Scope ignored = TraceContext.open(null, "outboxDispatch")) {
             long start = System.currentTimeMillis();
             int sent = outboxService.dispatchDue(properties.getBatchSize());
             if (sent > 0) {
@@ -62,7 +67,7 @@ public class OutboxDispatchTask {
      */
     @Scheduled(fixedDelayString = "${seckill.outbox.purge-interval-ms:600000}")
     public void purge() {
-        try {
+        try (TraceContext.Scope ignored = TraceContext.open(null, "outboxPurge")) {
             outboxService.purgeExpired();
         } catch (Exception e) {
             log.error("[Outbox·归档] 本轮执行异常", e);

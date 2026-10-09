@@ -14,6 +14,7 @@ import com.dustikun.seckill.Mq.SeckillMessageProducer;
 import com.dustikun.seckill.Service.SeckillPersistenceService.PersistOutcome;
 import com.dustikun.seckill.entity.Order;
 import com.dustikun.seckill.entity.OutboxMessage;
+import com.dustikun.seckill.monitor.core.TraceContext;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.dao.DataAccessException;
@@ -139,6 +140,19 @@ public class SeckillService {
         }
 
         String orderNo = orderNoGenerator.next();
+
+        // ------------------------------------------------------------------
+        // 【把单号写进日志上下文，这是「一单到底怎么了」唯一可用的连接键】
+        //
+        // 请求线程此时才知道单号（它由 Snowflake 现场生成），因此只能在这里写；
+        // 而消费线程处理同一条消息时会用它作为 traceId（见 SeckillOrderConsumer），
+        // 于是两侧日志都带上了 orderNo=…，一行 grep 就能把两段拼起来。
+        //
+        // 不这样做的话，两侧的 traceId 是两套值（请求侧是随机 hex，消费侧是 mq-<单号>），
+        // 排查一单问题要先用时间戳猜、再人工比对单号 —— 而「猜」正是这套日志要消灭的东西。
+        // ------------------------------------------------------------------
+        TraceContext.put(TraceContext.ORDER_NO, orderNo);
+        TraceContext.put(TraceContext.STOCK_ID, String.valueOf(stockId));
 
         if (!outboxProperties.isEnabled()) {
             return acceptWithoutOutbox(orderNo, userId, stockId, preDeducted, producer);

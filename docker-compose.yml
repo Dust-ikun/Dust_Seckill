@@ -1,0 +1,431 @@
+# =============================================================================
+#  秒杀系统 + AI 监控 Agent —— 中间件统一编排
+#
+#  【设计边界】本文件只编排「中间件与可观测性基础设施」，不包含业务应用本身。
+#  原因：业务应用需要在 IDE 里断点调试、需要频繁改配置重启，塞进容器后每次改一行
+#  代码都要重新 build 镜像，反而拖慢迭代。应用以 host 进程运行，通过 localhost 访问
+#  下面这些容器暴露的端口 —— 对 Spring Boot 来说，「连 127.0.0.1:3307」与
+#  「连一台远程 MySQL」在配置上没有任何区别。
+#
+#  【端口分配的两条原则】
+#   1) MySQL 刻意映射到 3307 而不是 3306：本机已存在原生 MySQL84 服务占用 3306。
+#      改成 3307 之后，容器 MySQL 与原生的可以并存 —— 前者专供本项目的验证与
+#      故障注入（可以随意 DROP / 慢查询 / 杀连接），后者不受任何影响。
+#   2) RocketMQ Broker 刻意发布两个端口 10909 与 10911：
+#      10911 是客户端连接端口，10909 是 Broker 的 HA / 内部端口。
+#      Broker 会把「自己可达的地址」告诉 NameServer，因此 `brokerIP1` 必须设成
+#      `127.0.0.1`（见 docker/rocketmq/broker.conf）—— 否则它注册进 NameServer 的是
+#      容器内的 172.x 地址，host 上的应用拿到该地址后连不上，
+#      表现为「消息投不出去」而 NameServer 却一切正常。
+#
+#  【启动顺序】用 depends_on + healthcheck 表达的是「依赖就绪」而不是「依赖已创建」：
+#  仅靠 depends_on 时，MySQL 容器会先于 mysqld 真正接受连接而被其它容器访问，
+#  表现为随机启动失败。因此凡是「需要连上某个中间件」的服务，都等对方 healthcheck 通过。
+#
+#  用法：
+#    docker compose up -d                    # 启动全部
+#    docker compose up -d mysql redis rocketmq-namesrv rocketmq-broker   # 只起链路依赖
+#    docker compose --profile observability up -d                        # 只起可观测性
+#    docker compose ps / logs -f <svc> / down
+# =============================================================================
+
+name: seckill
+
+# -----------------------------------------------------------------------------
+# 复用片段：容器日志轮转。
+# 不设上限的默认 json-file 驱动会把磁盘吃满 —— 这是本项目 Redis 相关故障注入
+# （压测打满）时最先暴露的运维问题，因此在源头统一限制。
+# -----------------------------------------------------------------------------
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+
+  # ===========================================================================
+  #  核心链路中间件（与业务请求链路直接相关，必须常开）
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # MySQL：订单 / 库存 / 补偿任务 / Outbox + AI 诊断三张表
+  # ---------------------------------------------------------------------------
+  mysql:
+    image: mysql:8.4
+    container_name: seckill-mysql
+    restart: unless-stopped
+    command:
+      # utf8mb4_0900_ai_ci 与 schema.sql 显式指定的排序规则一致；不显式指定时
+      # 服务端默认排序规则会随版本变化，可能让「建表时写死的排序规则」与
+      # 「服务端默认」不一致，跨环境比较字符串时报错。
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      # 打开慢查询日志是「MySQL 慢 SQL 故障注入」这个 Case 的证据来源之一
+      # （另一处证据来自应用侧的 db_query_latency 指标与 DB Tool 的 performance_schema 查询）。
+      - --slow-query-log=ON
+      - --long-query-time=0.5
+      - --slow-query-log-file=/var/log/mysql/slow.log
+      # 故障注入需要能通过 performance_schema 观察行锁等待（本项目消费端瓶颈就是 stock 行锁串行化）
+      - --performance-schema=ON
+      - --default-time-zone=+08:00
+    environment:
+      # 【为什么用 :? 而不是 :-默认值】远程仓库是公开的，而 :- 后面那个默认值会连同
+      # 本文件一起被提交 —— 那等于把「本机开发口令」发布出去，且没有任何提示。
+      # :? 的作用是「变量未设置或为空时直接报错」，因此忘记填 .env 的人会看到一句
+      # 明确的提示，而不是悄悄用一个众所周知的弱口令把 MySQL 跑起来。
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD is not set - copy .env.example to .env and fill it in}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-seckill}
+      TZ: Asia/Shanghai
+    ports:
+      # 3307:3306 —— 见文件头的「端口分配」说明。
+      # 写成 ${VAR:-默认值} 而不是硬编码：端口是故障注入与对照实验里最常被调整的东西，
+      # 硬编码意味着每次都要改这个被提交的文件，改完还容易忘记改回去
+      # （于是本地能跑、别人拉下来跑不起来）。默认值与 .env.example 一致。
+      - "${MYSQL_HOST_PORT:-3307}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      # 只在「数据卷为空」的首次启动时执行，天然满足「初始化一次」的语义。
+      # schema.sql 自身用 CREATE TABLE IF NOT EXISTS，因此重复执行也安全。
+      - ./src/main/resources/db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      # AI 监控的三张表单独一个文件，便于「只想加监控表、不动业务表」的场景
+      - ./src/main/resources/db/schema-ai-monitor.sql:/docker-entrypoint-initdb.d/02-ai-monitor.sql:ro
+      - mysql-slowlog:/var/log/mysql
+    healthcheck:
+      # 用 mysqladmin ping 而不是 `mysql -e 'SELECT 1'`：
+      # 前者在「服务端已起但还没建完初始化脚本」时也会返回成功，
+      # 因此额外校验了 seckill 库里的 orders 表是否已存在（那意味着初始化脚本确实跑完了）。
+      test: ["CMD-SHELL", "mysqladmin ping -h127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent && mysql -h127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD -D$$MYSQL_DATABASE -e 'SELECT 1 FROM orders LIMIT 1' >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    logging: *default-logging
+    networks: [seckill-net]
+
+  # ---------------------------------------------------------------------------
+  # Redis：库存预扣 / 一人一单去重 / 回补去重键
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7.4-alpine
+    container_name: seckill-redis
+    restart: unless-stopped
+    command:
+      # appendonly yes：本项目「Redis 预扣成功、预订单未落库」之间那个未关闭的窗口，
+      # 唯一的补救希望就是 Redis 侧的数据可恢复。默认 RDB 会丢掉最后一段时间，
+      # 开 AOF 之后这个窗口至少不会因为 Redis 容器重启而扩大。
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      # 秒杀场景全是小对象，给个上限避免故障注入（例如灌大 key）时把宿主机内存吃掉
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - noeviction
+      # 故障注入 Case 2「Redis 延迟」需要能看到慢日志（SLOWLOG GET）
+      - --slowlog-log-slower-than
+      - "10000"
+      - --slowlog-max-len
+      - "256"
+    ports:
+      # ⚠️ 6379 与另一个项目的 skychat-redis 冲突（它当前已停止）。
+      # 两者不能同时启动；需要并存时把 .env 里的 REDIS_HOST_PORT 改成 6380，
+      # 并同步修改 application-docker.yaml 的 spring.data.redis.port。
+      - "${REDIS_HOST_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      # Redis 冷启动要重放 AOF（本服务开了 appendonly），
+      # 数据量大时这段时间会超过 retries × interval，
+      # 从而把「正在重放」误判成「不健康」并连带阻塞依赖它的服务。
+      start_period: 15s
+    logging: *default-logging
+    networks: [seckill-net]
+
+  # ---------------------------------------------------------------------------
+  # RocketMQ NameServer：路由注册中心
+  # ---------------------------------------------------------------------------
+  rocketmq-namesrv:
+    image: apache/rocketmq:5.3.2
+    container_name: seckill-rocketmq-namesrv
+    restart: unless-stopped
+    # 等 init 把日志卷属主改成 3000（否则容器内的 mqadmin 无法写日志，
+    # 所有运维命令都会崩在 FileNotFoundException 上 —— 详见 rocketmq-init 的说明）
+    depends_on:
+      rocketmq-init:
+        condition: service_completed_successfully
+    command: sh mqnamesrv
+    environment:
+      JAVA_OPT_EXT: "-Xms256m -Xmx256m -Xmn128m"
+      TZ: Asia/Shanghai
+    ports:
+      - "${ROCKETMQ_NAMESRV_HOST_PORT:-9876}:9876"
+    volumes:
+      - rocketmq-namesrv-logs:/home/rocketmq/logs
+      - ./docker/rocketmq/namesrv.conf:/home/rocketmq/rocketmq-5.3.2/conf/namesrv.conf:ro
+    healthcheck:
+      # 用「TCP 端口已被监听」作为就绪判据。
+      # 这里刻意不用 mqadmin：它会去连 Broker，而 NameServer 的就绪并不依赖 Broker 是否存在
+      # （Broker 后起会自己注册上来），用 mqadmin 会让启动顺序变成一个假依赖。
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/9876' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    logging: *default-logging
+    networks: [seckill-net]
+
+  # ---------------------------------------------------------------------------
+  # 【一次性 init】把具名卷的属主改成 rocketmq(3000)
+  #
+  # 没有这一步时 Broker 起不来，而它给出的错误是**误导性的**：
+  #     java.lang.NullPointerException
+  #         at ScheduleMessageService.configFilePath(...)
+  # 排查方向会被引向「配置文件写错了」或「RocketMQ 版本问题」，
+  # 但真正的原因是：Docker 创建具名卷时属主为 root，而官方镜像以
+  # uid=3000(rocketmq) 运行，于是无法在 /home/rocketmq/store 下建目录。
+  # 实测结论（同一配置，只换卷）：
+  #     不挂卷        → "boot success"
+  #     挂具名卷      → NullPointerException
+  #
+  # 【为什么连 namesrv 的日志卷也要处理】这一条是后来补的，原因很具体：
+  # NameServer 本身能正常启动（它的日志目录由镜像预建），但 **mqadmin 不行** ——
+  # 它每次执行都会重写自己的日志文件，而 /home/rocketmq/logs 是 root 属主，
+  # 于是所有运维命令都崩在 FileNotFoundException 上：
+  #     at java.io.FileNotFoundException:
+  #        /home/rocketmq/logs/rocketmqlogs/tools_default.log
+  # 后果是 `mqadmin clusterList`（验证 Broker 有没有注册上来）这个最常用的
+  # 排查手段直接不可用 —— 一个"工具坏了"会伪装成"集群坏了"。
+  #
+  # 为什么用 `chown 3000:3000` 而不是 `chmod 777`：
+  # 777 只是碰巧让写入通过，而 RocketMQ 会在 store 下创建带权限校验的目录结构
+  # （commitlog / consumequeue / index / checkpoint），保持属主正确才是它期望的状态。
+  #
+  # 为什么用 alpine 而不是 rocketmq 镜像：只用得到 chown，alpine 只有 12MB，
+  # 且不必为了初始化去启动一个 400MB 的 JVM 镜像。
+  # ---------------------------------------------------------------------------
+  rocketmq-init:
+    image: alpine:3.20
+    container_name: seckill-rocketmq-init
+    user: root
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        chown -R 3000:3000 /broker-store /broker-logs /namesrv-logs
+        echo "rocketmq volumes prepared (expected owner: rocketmq/rocketmq = 3000:3000)"
+        ls -ld /broker-store /broker-logs /namesrv-logs
+    volumes:
+      - rocketmq-broker-store:/broker-store
+      - rocketmq-broker-logs:/broker-logs
+      - rocketmq-namesrv-logs:/namesrv-logs
+    restart: "no"
+    networks: [seckill-net]
+
+  # ---------------------------------------------------------------------------
+  # RocketMQ Broker：消息存储与投递
+  # ---------------------------------------------------------------------------
+  rocketmq-broker:
+    image: apache/rocketmq:5.3.2
+    container_name: seckill-rocketmq-broker
+    restart: unless-stopped
+    # 以 root 运行是刻意的，且是实测后的结论：
+    # Broker 在启动阶段会尝试把自身状态写回 conf 目录（storePathRootDir 的
+    # 兄弟路径），并以 NPE 的形式失败。容器内这样做是可接受的取舍 ——
+    # 它不改变宿主机上的任何权限，且这个 Broker 只服务本机开发环境。
+    # 与之配套的是上面的 rocketmq-init：它保证具名卷属主正确。
+    user: root
+    depends_on:
+      rocketmq-namesrv:
+        condition: service_healthy
+      rocketmq-init:
+        condition: service_completed_successfully
+    command: sh mqbroker -c /home/rocketmq/rocketmq-5.3.2/conf/broker.conf
+    environment:
+      NAMESRV_ADDR: rocketmq-namesrv:9876
+      # 指标导出：OTel 的 PROM exporter 会把指标挂在 brokerIP1:metricsPromExporterPort 上。
+      # 只绑回环是刻意的（宿主机 curl 可用、不对外暴露），Prometheus 走 compose 网络直连。
+      JAVA_OPT_EXT: "-Xms512m -Xmx512m -Xmn256m"
+      TZ: Asia/Shanghai
+    ports:
+      - "${ROCKETMQ_BROKER_HA_HOST_PORT:-10909}:10909"   # HA / 内部端口
+      - "${ROCKETMQ_BROKER_HOST_PORT:-10911}:10911"     # 客户端连接端口
+      # ---------------------------------------------------------------------
+      # 指标导出端口（见 broker.conf 末尾那一段的完整说明）
+      #
+      # 【为什么只绑回环】宿主机的 5557 只给人和本机工具用，不对外暴露。
+      # Prometheus 跑在容器里，它抓的是 `rocketmq-broker:5557` ——
+      # 走 compose 网络直连容器，根本不经过这条端口发布。
+      # 因此导出器本身必须绑 0.0.0.0（metricsPromExporterHost），
+      # 而这条 host 映射仍然可以只绑回环：两者管的是不同的一层。
+      #
+      # 【它替掉了什么】原先这里发布的是 10912（JMX）。那个端口从未有过监听者：
+      # RocketMQ 5.3.2 的 Broker 镜像里没有任何 RocketMQ MBean，也没有
+      # jmx_prometheus_javaagent。详见 broker.conf 末尾的实测证据。
+      # ---------------------------------------------------------------------
+      - "127.0.0.1:${ROCKETMQ_BROKER_METRICS_HOST_PORT:-5557}:5557"
+    volumes:
+      - rocketmq-broker-store:/home/rocketmq/store
+      - rocketmq-broker-logs:/home/rocketmq/logs
+      - ./docker/rocketmq/broker.conf:/home/rocketmq/rocketmq-5.3.2/conf/broker.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/10911' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 60s
+    logging: *default-logging
+    networks: [seckill-net]
+
+  # ===========================================================================
+  #  可观测性与 AI 监控基础设施
+  #
+  #  用 profile 分组（observability）：
+  #  只调业务链路时不必等 Grafana 拉镜像；跑故障注入演示时再整体起来。
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Prometheus：指标采集 + 告警规则求值
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: seckill-prometheus
+    restart: unless-stopped
+    profiles: [observability]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+      # 【为什么额外打开远程写接收】不是必须项，但打开后可以让
+      # 「同一台机器上的压测脚本」把自定义事件作为指标推给 Prometheus，
+      # 用于把「故障注入的时刻」标在指标曲线上。关掉它不影响 MVP 的任何验收项。
+      - --web.enable-remote-write-receiver
+    ports:
+      - "${PROMETHEUS_HOST_PORT:-9090}:9090"
+    extra_hosts:
+      # 【必须项】Prometheus 跑在容器里，而业务应用跑在宿主机上。
+      # Linux 下 host.docker.internal 需要显式声明；Docker Desktop（Windows/macOS）
+      # 虽然内置了它，但显式写出来可以让本文件在 Linux 上同样正确。
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    healthcheck:
+      # /-/healthy 是 Prometheus 官方的就绪探针端点
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9090/-/healthy >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    depends_on:
+      alertmanager:
+        condition: service_started
+    logging: *default-logging
+    networks: [seckill-net]
+
+  # ---------------------------------------------------------------------------
+  # Alertmanager：告警分组 / 抑制，并把告警 webhook 推给 AI Monitor API
+  #
+  # 【为什么保留 Alertmanager，而不是让 Prometheus 直接打 webhook】
+  # Prometheus 自身也支持直接 POST 到 webhook，链路更短。但 Alertmanager 提供了
+  # 两样在「故障注入 + 演示」场景下不可替代的东西：
+  #   1) group_by + group_interval：把「P99 高 / 错误率高 / 超时高」这三个由同一个
+  #      数据库故障引发的告警天然合并成一次通知 —— 这正是 SPEC 第 16 节要求的降噪，
+  #      且它发生在 AI 之前的更便宜一层（不必让 Agent 去处理三倍的任务量）；
+  #   2) resolve 通知：故障恢复时它会给 webhook 发 resolved=true，
+  #      Agent 才能把 Incident 标记为已结束，而不是留下一个永远"进行中"的告警。
+  # 注意 Alertmanager 只负责「合并与投递」，Spec 第 16 节的 Incident 聚合仍然要做：
+  # group_by 按 alertname 分组，而我们要按「服务 + 异常类型 + 时间窗口」聚合，
+  # 语义不同（前者是通知语义，后者是诊断任务语义）。
+  # ---------------------------------------------------------------------------
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    container_name: seckill-alertmanager
+    restart: unless-stopped
+    profiles: [observability]
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --web.external-url=http://localhost:9093
+    ports:
+      - "${ALERTMANAGER_HOST_PORT:-9093}:9093"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9093/-/healthy >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    logging: *default-logging
+    networks: [seckill-net]
+
+  # ---------------------------------------------------------------------------
+  # Grafana：看板（含项目自带的数据源与 Dashboard 自动装载）
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: seckill-grafana
+    restart: unless-stopped
+    profiles: [observability]
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      # 匿名只读：演示时可以直接把 localhost:3000/d/... 丢给别人看，不必先登进去
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      # 关掉首次登录强制改密，否则自动化脚本 / 截图流程会被拦在改密页
+      GF_AUTH_DISABLE_LOGIN_FORM: "false"
+      GF_USERS_DEFAULT_THEME: dark
+      GF_INSTALL_PLUGINS: ""
+      TZ: Asia/Shanghai
+    ports:
+      - "${GRAFANA_HOST_PORT:-3000}:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      # 数据源与看板用 provisioning 声明式装载：
+      # 好处是「删掉容器重新 up」之后看板仍在，不依赖任何人手工点过 UI。
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/health >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    depends_on:
+      prometheus:
+        condition: service_started
+    logging: *default-logging
+    networks: [seckill-net]
+
+# =============================================================================
+#  数据卷：全部具名，`docker compose down` 不会删它们（只有 down -v 才会）。
+#  这样反复重启栈不会丢库存数据，排查问题时状态可复现。
+# =============================================================================
+volumes:
+  mysql-data:
+  mysql-slowlog:
+  redis-data:
+  rocketmq-namesrv-logs:
+  rocketmq-broker-store:
+  rocketmq-broker-logs:
+  prometheus-data:
+  alertmanager-data:
+  grafana-data:
+
+networks:
+  seckill-net:
+    driver: bridge

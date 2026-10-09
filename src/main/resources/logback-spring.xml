@@ -1,0 +1,150 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ============================================================================
+   结构化日志配置（SPEC 第 6.2 节 / 批次 1 任务 1.2）
+
+   【为什么现在才有这个文件】在此之前项目用的是 Spring Boot 的默认配置
+   （logback 的 BasicConfigurator），日志只有「时间 级别 类名 - 消息」四段。
+   它能回答「发生了什么」，但回答不了本项目排障时最常问的三个问题：
+
+     ① 这一次下单的日志在哪？          → 需要 traceId（MDC）
+     ② 这条错误对应哪个业务错误码？     → 需要 errorCode（MDC）
+     ③ 这几千行 ERROR 里有几种不同的错？ → 需要结构化字段（见 LogRingBufferAppender）
+
+   ① 与 ② 在本文件的 pattern 里可见；③ 交给 RING_BUFFER appender，
+   它把日志<b>以字段形式</b>投进进程内环形缓冲，供 Logs Tool 查询。
+
+   ============================================================================
+   【两个 appender 的分工，不要混】
+     CONSOLE / FILE  → 给人看：IDE 控制台、排障时 tail -f、故障复盘的证据
+     RING_BUFFER     → 给机器看：Logs Tool 按字段检索，最终进入 LLM 的上下文
+   两者的【格式刻意不同】：给机器的那份不需要「好看的排版」，把它做成 JSON
+   只会让 Logs Tool 额外做一次反序列化；而给人看的那份若做成 JSON，
+   人眼就没法扫了。所以：人看的是文本，机器读的是对象。
+   ============================================================================
+
+   【pattern 的每一段，以及为什么是这个顺序】
+     %d{yyyy-MM-dd HH:mm:ss.SSS}  精确到毫秒。秒级精度下同一次下单的三行日志
+                                  顺序不确定，而那正是最需要确定的地方。
+     %-5level                     级别左对齐 5 格，保证「消息从同一列开始」
+     [%X{traceId:-}]              traceId；没有时渲染成空（不是 "null"）
+     [%X{operation:-}]            业务动作：建单 / 投递 / 消费确认 / 对账 …
+     [%X{errorCode:-}]            错误码：1000 库存不足、5001 投递失败 …
+                                  这三段都放在类名之前：排障时先看「哪条链路、哪个动作、
+                                  什么错误码」，再决定要不要去看是哪个类打的日志。
+     [%X{orderNo:-}]              单号。放在这里让「一单到底怎么了」可以只靠 grep 单号完成。
+     [%thread]                    线程名。消费线程与请求线程的日志交错时，
+                                  这是唯一能区分它们的字段（两者并发写同一份日志）。
+     %logger{36}                  类名（超长截断到 36 字符）
+     - %msg%n
+     %ex                          异常堆栈
+
+   【为什么用 %X{key:-} 而不是 %X{key}】没有该键时 %X{key} 会打印 "null"，
+   于是日志里出现 "traceId=null" —— 一个看起来像值、实际是「不存在」的字符串。
+   用 :- 空默认值后，缺失就是真的什么都没打印。
+   ============================================================================
+-->
+<configuration>
+
+    <!-- 让 Spring Boot 的 logging.* 配置（logging.level.* 等）继续生效。
+         没有这一行，下面 pattern 里引用的 ${CONSOLE_LOG_PATTERN} 等变量不存在，
+         且 application.yaml 里配置的日志级别会被静默忽略。 -->
+    <include resource="org/springframework/boot/logging/logback/defaults.xml"/>
+
+    <springProperty scope="context" name="APP_NAME" source="spring.application.name"
+                    defaultValue="Dust-ikun_seckill"/>
+
+    <property name="LOG_HOME" value="${LOG_HOME:-logs}"/>
+
+    <!-- 给人看的格式：Console（带颜色）与 File（不带颜色）共用同一份结构 -->
+    <property name="PLAIN_PATTERN"
+              value="%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%X{traceId:-}] [%X{operation:-}] [%X{errorCode:-}] [%X{orderNo:-}] [%thread] %logger{36} - %msg%n%ex"/>
+    <property name="COLOR_PATTERN"
+              value="%d{yyyy-MM-dd HH:mm:ss.SSS} %highlight(%-5level) [%cyan(%X{traceId:-})] [%magenta(%X{operation:-})] [%red(%X{errorCode:-})] [%yellow(%X{orderNo:-})] [%thread] %logger{36} - %msg%n%ex"/>
+
+    <!-- ======================================================================
+         CONSOLE：IDE / 前台运行时的出口
+         ====================================================================== -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>${COLOR_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!-- ======================================================================
+         FILE：滚动文件出口
+
+         【为什么必须先有滚动策略再谈「写文件」】没有 RollingFileAppender 时，
+         想让日志落盘的人最常用的做法是 `> app.log`，那会在一次压测里
+         轻易写出几个 GB 并且永不清理，直到磁盘满 —— 而磁盘满会让 MySQL 一起挂。
+         尺寸 + 总量双上限是这里的底线：单文件 100MB、总量 1GB、保留 15 天。
+         ====================================================================== -->
+    <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_HOME}/${APP_NAME}.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_HOME}/${APP_NAME}.%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
+            <maxFileSize>100MB</maxFileSize>
+            <maxHistory>15</maxHistory>
+            <totalSizeCap>1GB</totalSizeCap>
+            <cleanHistoryOnStart>false</cleanHistoryOnStart>
+        </rollingPolicy>
+        <encoder>
+            <pattern>${PLAIN_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!-- 文件写入放到独立线程：一次磁盘抖动不该让请求线程等 IO。
+         注意队列深度 4096 与 neverBlock=false：队列满时 AsyncAppender 会
+         丢弃 TRACE/DEBUG/INFO 并保留 WARN/ERROR（它按级别从低到高丢），
+         这正是我们想要的方向 —— 宁可少 INFO，不可少 ERROR。 -->
+    <appender name="ASYNC_FILE" class="ch.qos.logback.classic.AsyncAppender">
+        <appender-ref ref="FILE"/>
+        <queueSize>4096</queueSize>
+        <discardingThreshold>0</discardingThreshold>
+        <neverBlock>true</neverBlock>
+        <includeCallerData>false</includeCallerData>
+    </appender>
+
+    <!-- ======================================================================
+         RING_BUFFER：Logs Tool 的数据底座（批次 1 任务 1.3）
+
+         【为什么 level 是 INFO 而不是 DEBUG】本项目的消费链路在正常路径上
+         打的是 INFO（「消费·确认成功」），而压测链路里还有 DEBUG。
+         把 DEBUG 也收进缓冲会：① 让容量被噪音吃掉（10000 条里可能 9000 条是 DEBUG）；
+         ② 让 Logs Tool 的 keyword 检索命中一堆无诊断价值的行。
+         需要 DEBUG 时把它调成 DEBUG 即可 —— 这是一个显式的动作，不是默认行为。
+
+         【capacity 的取值理由】10000 条 × 单条上限 4000 字符 ≈ 最坏 80MB，
+         但实际日志平均长度约 200 字符，占用约 4~6MB。
+         10000 条在「一次故障刷屏」的场景下约等于最近几分钟到几十分钟的窗口，
+         够做故障诊断；而它的上界是硬的 —— 这与「日志不能把应用拖死」直接相关。
+         ====================================================================== -->
+    <appender name="RING_BUFFER"
+              class="com.dustikun.seckill.monitor.log.LogRingBufferAppender">
+        <capacity>10000</capacity>
+        <maxMessageChars>4000</maxMessageChars>
+        <writeLockTimeoutMillis>5</writeLockTimeoutMillis>
+        <level>INFO</level>
+    </appender>
+
+    <!-- ======================================================================
+         日志级别
+         ====================================================================== -->
+    <logger name="com.dustikun.seckill" level="INFO"/>
+    <!-- RocketMQ 客户端在重连/心跳时比较吵，INFO 会把业务日志挤走 -->
+    <logger name="org.apache.rocketmq" level="WARN"/>
+    <!-- Lettuce 每次建连都打一行，压测时会刷屏 -->
+    <logger name="io.lettuce" level="WARN"/>
+    <logger name="io.netty" level="WARN"/>
+
+    <!-- 只在默认 profile 下让 Spring 的 INFO 启动日志可见；
+         docker profile 里启动日志会写进容器日志，不需要在这里重复 -->
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+        <appender-ref ref="ASYNC_FILE"/>
+        <appender-ref ref="RING_BUFFER"/>
+    </root>
+
+</configuration>

@@ -5,6 +5,7 @@ import com.dustikun.seckill.Metrics.SeckillMetrics;
 import com.dustikun.seckill.Service.CompensateTaskService;
 import com.dustikun.seckill.Service.OutboxService;
 import com.dustikun.seckill.Service.StockReconcileService;
+import com.dustikun.seckill.monitor.core.TraceContext;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -75,7 +76,9 @@ public class MaintenanceTask {
      */
     @Scheduled(fixedDelayString = "${seckill.maintenance.compensate.interval-ms:30000}")
     public void retryCompensateTasks() {
-        try {
+        // 定时任务的线程池会复用线程，MDC 不会自动清 —— 不开作用域时本轮日志
+        // 会带上上一轮（甚至上一个任务）的 traceId，那比没有 traceId 更容易误导人。
+        try (TraceContext.Scope ignored = TraceContext.open(null, "retryCompensate")) {
             int pending = compensateTaskService.retryDue(compensateBatchSize);
             if (pending > 0) {
                 log.info("[维护任务·待补偿] 本轮结清 {} 条，仍待处理 {} 条",
@@ -104,7 +107,9 @@ public class MaintenanceTask {
      */
     @Scheduled(fixedDelayString = "${seckill.maintenance.reconcile.interval-ms:300000}")
     public void reconcileStocks() {
-        try {
+        // 与待补偿任务同理：一轮一个 traceId。对账是最需要「事后能把一轮的判定过程完整捞出来」
+        // 的动作，因为它默认只告警不改数据，人工复核时要看的就是那一轮的全部推理痕迹。
+        try (TraceContext.Scope ignored = TraceContext.open(null, "reconcile")) {
             if (reconcileStockIds == null || reconcileStockIds.isEmpty()) {
                 return;
             }

@@ -1,0 +1,486 @@
+# =============================================================================
+#  告警规则（Alerting Rules）
+#
+#  【每一条规则的阈值都是「故意写小」的】本项目是本地验证环境，压测流量只有
+#  几百 QPS，触发阈值若按生产量级设定，故障注入将永远不会产生告警，
+#  于是「Agent 能不能被触发」这件事就永远验证不了。所有偏离生产常识的取值
+#  都在规则注释里标了 `[本地阈值]`，并写清了生产环境应当改成什么。
+#
+#  【每条规则都必须能被一条具体的故障注入用例触发】
+#  写不出触发方式的告警规则不是监控，是噪音。因此每条规则都标了
+#  `[触发方式]`，直接对应 SPEC 第 19 节的五个 Case。没有对应 Case 的规则
+#  只有一条（ServiceDown），它是所有诊断的前提，值得单独存在。
+#
+#  【为什么错误率阈值不看 4xx】本项目的 4xx 是**正常业务响应**：
+#  库存不足(1001)、重复下单(1002)、未预热(1003) 都会走 4xx。
+#  把 4xx 算进错误率，这条告警会在任何一次正常秒杀活动中持续触发，
+#  然后被运维习惯性忽略 —— 一个"总是响"的告警等于没有告警。
+#  因此所有错误率口径一律 `status=~"5.."`。
+# =============================================================================
+
+groups:
+
+  # ===========================================================================
+  #  一、可用性（所有诊断的前提）
+  # ===========================================================================
+  - name: seckill-availability
+    rules:
+
+      # -----------------------------------------------------------------------
+      # 业务应用不可达（或 actuator 端点挂了）
+      #
+      # 【为什么这条规则是特殊的】它是唯一一条「不依赖任何业务指标」的规则：
+      # 它只读 Prometheus 自己产生的 `up`。其余所有规则在应用挂掉时都会因为
+      # 序列消失而变成 no data（在 Prometheus 里表现为 inactive，而不是 firing）——
+      # 也就是说，没有这条规则时，「应用死了」这个最严重的情况反而不会产生任何告警。
+      # -----------------------------------------------------------------------
+      - alert: ServiceDown
+        expr: up{job="order-service"} == 0
+        for: 1m
+        labels:
+          severity: CRITICAL
+          service: order-service
+          alert_type: SERVICE_DOWN
+        annotations:
+          summary: "业务应用不可达（Prometheus 抓不到 /actuator/prometheus）"
+          description: >-
+            目标 {{ $labels.instance }} 已经连续 1 分钟抓取失败。
+            常见原因：应用进程已退出、管理端口 9091 未监听、
+            或 application-docker.yaml 未生效导致 management.server.address
+            仍绑在 127.0.0.1（容器内的 Prometheus 连不上）。
+          runbook: "docs/AI监控Agent_部署与验收手册.md"
+
+      # -----------------------------------------------------------------------
+      # 关键中间件的连通性
+      #
+      # 【为什么不直接用 health 端点做告警】/actuator/health 是一个**复合**结论：
+      # 它把 db、redis、diskSpace 揉成一个 UP/DOWN。诊断时我们需要知道是哪一个坏了，
+      # 因此这里用各自的专项指标分别告警，health 只作为人肉排查的入口。
+      # -----------------------------------------------------------------------
+      - alert: DbConnectionPoolExhausted
+        expr: |
+          hikaricp_connections_active{service="order-service"}
+          /
+          hikaricp_connections_max{service="order-service"} > 0.9
+        for: 1m
+        labels:
+          severity: CRITICAL
+          service: order-service
+          alert_type: DB_POOL_EXHAUSTED
+        annotations:
+          summary: "数据库连接池利用率超过 90%"
+          description: >-
+            活跃连接 {{ printf "%.1f" $value }} 倍于池上限。
+            本项目已实测过这个状态：消费线程数超过 Hikari maximum-pool-size(50) 时，
+            线程会互相等连接而非等锁。注意区分「池满」与「行锁排队」——
+            前者是本条告警，后者表现为连接池不满但请求很慢（看
+            seckill:http_p99_latency:5m 与 MySQL 的 Innodb_row_lock_waits）。
+          runbook: "docs/AI监控Agent_部署与验收手册.md"
+
+  # ===========================================================================
+  #  二、API 性能（SPEC Case 1 / Case 2 的症状侧）
+  # ===========================================================================
+  - name: seckill-api-performance
+    rules:
+
+      # -----------------------------------------------------------------------
+      # 接口 P99 超过 1s（SPEC 第 15 节的示例规则）
+      #
+      # [本地阈值] 1s。本项目正常下单 P99 在几十毫秒量级（请求线程里没有热点行写），
+      # 因此 1s 对本系统而言是「已经明显不对」的信号，不需要再往下压。
+      # [触发方式] Case 1（MySQL 慢 SQL，例如给 stock 加一个全表扫描的慢查询并发压测）
+      #            或 Case 2（Redis 延迟，用 DEBUG SLEEP 或 CLIENT PAUSE 注入）
+      # -----------------------------------------------------------------------
+      - alert: ApiP99LatencyHigh
+        expr: seckill:http_p99_latency:5m > 1
+        for: 30s
+        labels:
+          severity: HIGH
+          service: order-service
+          alert_type: LATENCY_HIGH
+        annotations:
+          summary: "接口 {{ $labels.uri }} 的 P99 延迟超过 1s（当前 {{ printf \"%.2f\" $value }}s）"
+          description: >-
+            与 SPEC 第 7.2 节的 AlertEvent 示例一一对应：
+            metricName=http_request_duration_p99, alertType=LATENCY_HIGH。
+            注意 Agent 不应在拿到这一条之后就下结论 —— 它需要继续取证
+            （DB 延迟 / Redis 延迟 / 慢 SQL 数量 / MQ 堆积）才能定位根因，
+            这正是 SPEC 第 12 节强调「不应看到一项异常就立即下结论」的原因。
+          runbook: "docs/AI监控Agent_部署与验收手册.md"
+
+      # -----------------------------------------------------------------------
+      # 接口 5xx 错误率超过 5%
+      #
+      # [本地阈值] 5% 且持续 1 分钟。业务 4xx 被排除在外（见文件头说明）。
+      # -----------------------------------------------------------------------
+      - alert: ApiErrorRateHigh
+        expr: seckill:http_error_rate_all:5m > 0.05
+        for: 1m
+        labels:
+          severity: HIGH
+          service: order-service
+          alert_type: ERROR_RATE_HIGH
+        annotations:
+          summary: "接口 5xx 错误率超过 5%（当前 {{ printf \"%.2f\" $value }}）"
+          description: >-
+            仅统计 5xx。库存不足 / 重复下单这类业务拒绝走 4xx，不计入本告警。
+            排查起点：先看错误率是否集中在某一个 uri，再按 uri 去查日志里的
+            errorCode 分布（Logs Tool 的 search_logs）。
+          runbook: "docs/AI监控Agent_部署与验收手册.md"
+
+      # -----------------------------------------------------------------------
+      # 慢请求占比超过 20%
+      #
+      # 【它与 P99 告警的区别】P99 高说明「最慢的那 1% 很慢」，
+      # 可能只是少量请求受影响；慢请求占比高说明「大面积的请求都慢了」。
+      # 两者的根因往往不同：前者常是锁排队/个别慢查询，后者常是资源耗尽
+      # （连接池、线程池、Redis 单线程阻塞）。因此值得分成两条规则。
+      # -----------------------------------------------------------------------
+      - alert: ApiSlowRequestRateHigh
+        expr: seckill:http_slow_request_rate:5m > 0.2
+        for: 1m
+        labels:
+          severity: HIGH
+          service: order-service
+          alert_type: LATENCY_HIGH
+        annotations:
+          summary: "接口 {{ $labels.uri }} 超过 1s 的请求占比达到 {{ printf \"%.2f\" $value }}"
+          description: >-
+            大面积慢请求。优先怀疑共享资源：数据库连接池、Redis 单线程、
+            消费线程池。若同时伴随 DbConnectionPoolExhausted，
+            根因大概率在数据库侧而不是应用侧。
+
+  # ===========================================================================
+  #  三、数据库（SPEC Case 1）
+  # ===========================================================================
+  - name: seckill-database
+    rules:
+
+      # -----------------------------------------------------------------------
+      # 慢查询激增
+      #
+      # 【口径】用 http_server_requests_seconds_bucket 里 le="1.0" 之外的请求
+      # 作为「慢操作」的代理指标是不精确的 —— 它混入了 HTTP 层开销。
+      # 但本项目没有任何慢 SQL 的独立埋点，而 SPEC 第 9.3 节要求 DB Tool 提供
+      # get_slow_sql()，那条路径读的是 MySQL 的 performance_schema / 慢查询日志
+      # （精确值）。因此：
+      #   - 本告警负责「发现异常」（近似，够用）；
+      #   - DB Tool 负责「取证」（精确，来自数据库自身）。
+      # 这正是 SPEC 把 Metrics Tool 与 DB Tool 分开的原因：
+      # 指标用于发现，工具用于取证，两者不要求同一个数据源。
+      # -----------------------------------------------------------------------
+      - alert: SlowQuerySurge
+        expr: |
+          (
+            sum(rate(http_server_requests_seconds_count{uri="/seckill"}[5m]))
+            -
+            sum(rate(http_server_requests_seconds_bucket{uri="/seckill",le="1.0"}[5m]))
+          ) > 5
+        for: 1m
+        labels:
+          severity: HIGH
+          service: order-service
+          alert_type: DB_SLOW_QUERY
+        annotations:
+          summary: "秒杀接口超过 1s 的请求持续出现（> 5 次/秒）"
+          description: >-
+            Case 1 的特征信号。Agent 应继续调用 DB Tool 的 get_slow_sql()
+            取得**数据库侧**的慢查询明细（performance_schema.events_statements_summary_by_digest），
+            而不是仅凭本条告警就断言「是 MySQL 的问题」。
+          runbook: "docs/AI监控Agent_部署与验收手册.md"
+
+  # ===========================================================================
+  #  四、业务链路（SPEC Case 3 / Case 4 / Case 5）
+  # ===========================================================================
+  - name: seckill-pipeline
+    rules:
+
+      # -----------------------------------------------------------------------
+      # 订单成功率低于 99%（SPEC 第 15 节的业务指标规则）
+      #
+      # 【口径的严格定义】分母是「已走到终态的消费侧消息数」：
+      # 确认 + 取消 + 重试耗尽。刻意不用受理数做分母 ——
+      # 受理与确认之间隔着投递与消费两级异步，用受理数做分母会让活动刚开始的
+      # 几十秒必然显示低成功率，那是启动延迟而不是失败。
+      # -----------------------------------------------------------------------
+      - alert: OrderSuccessRateLow
+        expr: seckill:order_success_rate:5m < 0.99
+        for: 1m
+        labels:
+          severity: CRITICAL
+          service: order-service
+          alert_type: BUSINESS_SUCCESS_RATE_LOW
+        annotations:
+          summary: "订单确认成功率低于 99%（当前 {{ printf \"%.4f\" $value }}）"
+          description: >-
+            这是**业务侧**的最终信号，比任何技术指标都更接近用户的真实感受。
+            注意它只统计「已结案」的消息，因此在途积压不会拉低它 ——
+            若在途积压同时很高，说明问题在投递/消费能力，而不是订单本身失败。
+          runbook: "docs/AI监控Agent_部署与验收手册.md"
+
+      # -----------------------------------------------------------------------
+      # 投递 - 确认 的净增长速率持续为正 → 队列在堆积（SPEC 的 mq_lag > 10000）
+      #
+      # 【为什么用「增长速率」而不是「绝对值」】
+      # 绝对值需要 Broker 侧的消费位点（jmx_exporter 打通后才可用）。
+      # 而增长速率只需要两个进程内计数之差，**且它没有累计漂移问题**：
+      # 在途量 = sent - (confirmed + duplicate + orderMissing + failed)，四类结局
+      # 全部计入，因此这个差值在系统空闲时会回到 0，不会随运行时间单调增长。
+      # 这一点比「sent - confirmed」的朴素写法重要得多：后者会因为重复投递
+      # 而持续累积，一天之后基线就漂到几百，任何阈值都失去意义。
+      #
+      # [本地阈值] 5 条/秒。生产环境应按消费者实际处理能力设定。
+      # [触发方式] Case 3：把 seckill.mq.consume-thread-min 调成 1 并加大压测流量，
+      #            或 `docker compose stop rocketmq-broker` 制造消费停滞后再恢复。
+      # -----------------------------------------------------------------------
+      - alert: MqConsumeLagGrowing
+        expr: |
+          (
+            sum(rate(seckill_mq_sent_total[5m]))
+            -
+            sum(rate(seckill_consume_confirmed_total[5m]))
+            -
+            sum(rate(seckill_consume_duplicate_total[5m]))
+            -
+            sum(rate(seckill_consume_order_missing_total[5m]))
+            -
+            sum(rate(seckill_consume_failed_total[5m]))
+          ) > 5
+        for: 2m
+        labels:
+          severity: HIGH
+          service: order-service
+          alert_type: MQ_LAG_HIGH
+        annotations:
+          summary: "消息投递速率超过消费速率，队列正在堆积（净增长 {{ printf \"%.1f\" $value }} 条/秒）"
+          description: >-
+            Case 3 的特征信号。四类消费结局全部计入在途，
+            因此这个差值不会因重复投递而漂移。
+            排查方向：消费线程数（seckill.mq.consume-thread-min 不得超 Hikari 池上限）、
+            stock 行锁排队、以及 Broker 侧是否有队列热点。
+          runbook: "docs/AI监控Agent_部署与验收手册.md"
+
+      # -----------------------------------------------------------------------
+      # Outbox 待投递积压（SPEC 第 15 节的 outbox_pending_count，Case 4）
+      #
+      # 【为什么这条用绝对值而不是速率】outbox_pending 直接来自数据库
+      # `SELECT COUNT(*) WHERE status='PENDING'`，它是**存量事实**而不是估算，
+      # 多实例部署下依然准确（这正是当初把它做成 Gauge 的理由）。
+      # 存量类指标用阈值判断是恰当的，用速率反而会漏掉「稳定积压但不增长」的状态。
+      #
+      # [本地阈值] 1000 条。生产环境应结合 dispatch-interval 与 batch-size 定：
+      # 稳态吞吐 ≈ batch-size / dispatch-interval，超过它就意味着投递追不上受理。
+      # [触发方式] Case 4：`docker compose stop rocketmq-broker`，
+      #            持续压测 1~2 分钟，观察 PENDING 单调上升。
+      # -----------------------------------------------------------------------
+      - alert: OutboxBacklogHigh
+        expr: seckill:outbox_pending_now > 1000
+        for: 1m
+        labels:
+          severity: HIGH
+          service: order-service
+          alert_type: OUTBOX_BACKLOG
+        annotations:
+          summary: "Outbox 待投递记录积压超过 1000 条（当前 {{ printf \"%.0f\" $value }}）"
+          description: >-
+            Case 4 的特征信号：已受理但消息还没进 Broker。
+            注意这个数字来自数据库，是**真实欠账**而非估算。
+            若同时 mq_send_failed 在增长 → 问题在 Broker 可达性；
+            若 mq_send_failed 不增长而 pending 在涨 → 问题在投递器本身
+            （调度被阻塞、批量发送整体超时）。
+          runbook: "docs/AI监控Agent_部署与验收手册.md"
+
+      # -----------------------------------------------------------------------
+      # 需人工介入的欠账（终态失败，不会自愈）
+      #
+      # 【为什么这条比前面所有告警都更该被认真对待】
+      # 其余告警描述的是「系统正在变慢/堆积」，流量退去后可能自行恢复。
+      # 这条描述的是「已经有东西永久坏了，必须有人动手」：
+      #   - seckill_outbox_failed：投递重试耗尽，消息永远不会再投出去；
+      #   - seckill_compensate_pending：归还动作还没做完（库存账没平）。
+      # 两者都不会自愈，且直接对应「少卖」这个业务损失。
+      # -----------------------------------------------------------------------
+      - alert: ManualInterventionBacklog
+        expr: seckill:manual_intervention_backlog > 0
+        for: 5m
+        labels:
+          severity: CRITICAL
+          service: order-service
+          alert_type: DATA_INCONSISTENCY
+        annotations:
+          summary: "存在不会自愈的欠账，需要人工介入（当前 {{ printf \"%.0f\" $value }} 条）"
+          description: >-
+            outbox FAILED 与 compensate PENDING 之和大于 0。
+            正确的处理方式是调用 GET /seckill/reconcile?stockId=1 查看对账结论，
+            而不是直接改数据库 —— 存在悬空归还义务时，对账会刻意跳过库存校准。
+          runbook: "docs/AI监控Agent_部署与验收手册.md"
+
+      # -----------------------------------------------------------------------
+      # 对账发现不一致（SPEC Case 5：Redis / MySQL 数据不一致）
+      #
+      # 【为什么用 rate() 而不是绝对值】seckill_reconcile_findings_total 是
+      # 按 status 分标签的 Counter，累计值只会增长。用 rate() 才能回答
+      # 「最近还在产生新的不一致吗」—— 这正是「不一致是否仍在扩散」的判据。
+      # 注意 CONSISTENT 不计数，因此这条序列上出现的任何增量都是异常结论。
+      # -----------------------------------------------------------------------
+      - alert: ReconcileInconsistencyDetected
+        expr: |
+          sum by (status) (rate(seckill_reconcile_findings_total[10m])) > 0
+        for: 1m
+        labels:
+          severity: CRITICAL
+          service: order-service
+          alert_type: DATA_INCONSISTENCY
+        annotations:
+          summary: "对账结论 {{ $labels.status }} 正在持续产生"
+          description: >-
+            Case 5 的特征信号：Redis 与数据库的真实状态出现偏差。
+            注意 status 标签本身就是 Agent 的重要证据 ——
+            REDIS_AHEAD 意味着有扣减绕过了 Redis（降级写库路径），
+            STALE_PENDING / ABANDONED_PENDING 意味着有预订单不会自己走向终态。
+            Agent 应据此给出补偿建议，**而不是直接修改数据**（SPEC 第 19 节 Case 5）。
+          runbook: "docs/AI监控Agent_部署与验收手册.md"
+
+      # -----------------------------------------------------------------------
+      # 消费侧出现「订单缺失」—— 数据被人工/归档清掉的强信号
+      # -----------------------------------------------------------------------
+      - alert: ConsumeOrderMissing
+        expr: increase(seckill_consume_order_missing_total[10m]) > 0
+        labels:
+          severity: CRITICAL
+          service: order-service
+          alert_type: DATA_INCONSISTENCY
+        annotations:
+          summary: "消费端发现待投递凭据对应的订单不存在"
+          description: >-
+            该口径的含义很具体：orders 里有 outbox 凭据、orders 里却没有这条订单。
+            只可能是订单行被人工删除或归档清理掉了。
+            消费端此时**刻意不归还库存**（无法判断预扣是否已被消耗，取向是宁可少卖），
+            因此这个告警背后通常还跟着一笔需要人工核对的库存。
+
+  # ===========================================================================
+  #  五、Redis（SPEC Case 2）
+  # ===========================================================================
+  - name: seckill-redis
+    rules:
+
+      # -----------------------------------------------------------------------
+      # Redis 降级频繁触发
+      #
+      # 【这是本项目最有价值的告警之一】seckill_request_degraded_total 的语义是
+      # 「Redis 抛了 DataAccessException，链路回落到 MySQL 条件扣减」。
+      # 它一旦增长，就意味着两件事同时成立：
+      #   ① 性能防线已失守（全部压力打到数据库行锁）；
+      #   ② Redis 与数据库开始**漂移**（Redis 在故障期间被绕过），
+      #      而漂移只能靠对账发现和预热重置，不会自己消失。
+      # 因此哪怕只有 1 次，也值得让 Agent 介入并留下诊断记录。
+      # -----------------------------------------------------------------------
+      - alert: RedisDegradationTriggered
+        expr: increase(seckill_request_degraded_total[5m]) > 0
+        labels:
+          severity: HIGH
+          service: order-service
+          alert_type: REDIS_UNAVAILABLE
+        annotations:
+          summary: "Redis 不可用触发降级，链路由 MySQL 兜底"
+          description: >-
+            [触发方式] Case 2：`docker compose pause redis` 或
+            `docker compose exec redis redis-cli CLIENT PAUSE 5000`。
+            注意降级后**必须重新预热**（POST /seckill/preheat?stockId=1）
+            才能让两边重新对齐；对账也能发现漂移，但它默认不改数据。
+
+      # -----------------------------------------------------------------------
+      # Redis 操作变慢（Latency Monitor 视角）
+      #
+      # 【口径来源】lettuce_seconds_bucket 是 Lettuce 客户端侧的耗时分布，
+      # 包含网络往返 —— 比 Redis 自身的 SLOWLOG 更接近应用真实感受。
+      # 两者互补：本告警发现「应用觉得慢」，SLOWLOG 回答「慢在哪条命令」。
+      #
+      # 【为什么不是 lettuce_command_completion_seconds_bucket】那个名字**不存在**。
+      # 实测 /actuator/prometheus 暴露出来的仪表名是：
+      #   lettuce_seconds_*        ← 命令耗时（本告警要用的）
+      #   lettuce_active_seconds_* ← 命令在途时长
+      # 它们由 Spring Data Redis 的 Observation 产出，标签是 **db_operation**
+      # （EVALSHA / SADD / DECRBY ...）而不是 command。
+      # 写成原来的名字时这条规则的序列整体为空，告警永远停在 inactive ——
+      # 与 P99 那条是同一类静默失效，只是原因不同（名字错，不是没开直方图）。
+      # 配套的直方图开关见 application.yaml 的
+      # `management.metrics.distribution.percentiles-histogram.lettuce`。
+      # -----------------------------------------------------------------------
+      - alert: RedisOperationSlow
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le, db_operation) (
+              rate(lettuce_seconds_bucket[5m])
+            )
+          ) > 0.05
+        for: 1m
+        labels:
+          severity: HIGH
+          service: order-service
+          alert_type: REDIS_LATENCY_HIGH
+        annotations:
+          summary: "Redis 命令 {{ $labels.db_operation }} 的客户端侧 P99 超过 50ms"
+          description: >-
+            本地环境 Redis 是同机容器，正常 P99 应在 1ms 以内。
+            超过 50ms 通常意味着：Redis 单线程被阻塞
+            （大 key、KEYS/SCAN、或 CLIENT PAUSE 故障注入），
+            或容器 CPU 被其它服务抢占（RocketMQ Broker 的 JVM 是常见嫌疑）。
+          runbook: "docs/AI监控Agent_部署与验收手册.md"
+
+  # ===========================================================================
+  #  六、自监控（谁来看监控系统自己）
+  #
+  #  这几条告警在 alertmanager.yml 里被路由到独立的 receiver：
+  #  它们描述的是「监控系统自己坏了」，如果送给 AI Monitor，
+  #  Agent 会去查业务指标、发现一切正常，然后产出一份「未发现异常」的诊断，
+  #  反而掩盖了真正的问题。
+  # ===========================================================================
+  - name: seckill-meta-monitoring
+    rules:
+
+      - alert: TargetDown
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: WARNING
+          alert_type: MONITORING_TARGET_DOWN
+        annotations:
+          summary: "采集目标 {{ $labels.job }} ({{ $labels.instance }}) 连续 2 分钟不可达"
+          description: >-
+            注意 job="order-service" 的不可达同时也会触发 ServiceDown。
+            两条都发出来是刻意的：ServiceDown 面向「业务坏了」，
+            本条面向「为什么我的看板上没有数据」——两者的处置人可能不同。
+
+      - alert: PrometheusRuleEvaluationFailing
+        expr: |
+          increase(prometheus_rule_evaluation_failures_total[10m]) > 0
+        labels:
+          severity: WARNING
+          alert_type: MONITORING_RULE_ERROR
+        annotations:
+          summary: "Prometheus 告警规则求值失败"
+          description: >-
+            规则表达式有语法/语义错误时会出现这个信号。
+            典型原因是引用了不存在的指标名 —— 而这类错误不会让规则报错退出，
+            只会让它永远停在 inactive，是**静默失效**。
+            因此这条 meta 告警是必要的：它是「我的告警为什么没响」的唯一自查手段。
+
+      - alert: PrometheusConfigReloadFailed
+        expr: prometheus_config_last_reload_successful == 0
+        for: 5m
+        labels:
+          severity: WARNING
+          alert_type: MONITORING_CONFIG_ERROR
+        annotations:
+          summary: "Prometheus 配置热加载处于失败状态"
+          description: >-
+            修改 prometheus.yml 或 rules/*.yml 后执行
+            `curl -X POST http://localhost:9090/-/reload` 失败。
+            最可能是 YAML 缩进错误 —— 告警规则文件对缩进极其敏感，
+            且错误只体现在加载结果里、不影响主配置启动，
+            因此没有这条告警时，表现是「改了规则但告警行为没变」而非报错。
+            另外注意：规则文件语法错误时，求值失败会体现在
+            PrometheusRuleEvaluationFailing 上，两条一起看才能区分
+            「配置没加载」与「加载了但表达式算不出来」。
