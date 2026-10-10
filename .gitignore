@@ -59,6 +59,9 @@ logs/
 tools/fix_swallowed_keys.py
 docs/秒杀链路文档.md
 
+### 交接文档：写给 AI 会话的工作记录，不纳入版本控制 ###
+HANDOFF.md
+
 src/main/resources/application.yaml
 
 ### Docker Compose 本地环境变量 ###
