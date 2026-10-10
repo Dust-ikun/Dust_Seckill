@@ -99,22 +99,23 @@ public class SeckillOrderConsumer implements MessageListenerConcurrently {
         }
 
         // ------------------------------------------------------------------
-        // 【为什么必须在这里开一个 tracing 作用域】
+        // 【运行时观测（批次 5），旁路纪律与上面的 tracing 作用域相同】
         //
-        // MDC 底层是 ThreadLocal，它<b>不会</b>从请求线程传播到消费线程。没有这一段时：
-        //   · 消费侧所有日志的 traceId 为空（或更糟：残留着上一条消息的值，
-        //     因为 ConsumeMessageConcurrentlyService 的线程池会复用线程）；
-        //   · 于是「一次下单的建单日志」与「它被消费的日志」无法用同一个值串起来，
-        //     而 SPEC 第 12 节的诊断流程恰恰要求跨这两段取证。
-        //
-        // 作用域用 try-with-resources 包住<b>整条消费路径</b>（含 handleFailure），
-        // 因为失败路径的日志才是最需要 traceId 的那些。
+        // 这三行是 Case 3 无法定论后补上的取证能力（见 docs/故障注入实验记录.md §3.5）：
+        //   · onConsumeBegin/End → 消费线程池的活跃数（当前正在处理的消息条数）；
+        //   · finally 里的耗时 → 单条消息处理耗时直方图。
+        // 消费逻辑一行未改：观测只发生在入口与出口，失败路径也被 finally 覆盖。
+        // 漏掉 finally 的代价是活跃数单调上涨、永远回不到 0 —— 那是假的「线程池打满」。
         // ------------------------------------------------------------------
+        long startedAt = System.nanoTime();
+        metrics.onConsumeBegin();
         try (TraceContext.Scope ignored = TraceContext.open(
                 resolveTraceId(messageExt, message), "consumeOne",
                 Map.of(TraceContext.ORDER_NO, String.valueOf(message.orderNo()),
                         TraceContext.STOCK_ID, String.valueOf(message.stockId())))) {
             return doConsume(messageExt, message);
+        } finally {
+            metrics.onConsumeEnd(System.nanoTime() - startedAt);
         }
     }
 

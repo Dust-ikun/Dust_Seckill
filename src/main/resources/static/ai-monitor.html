@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI 监控 Agent 控制台</title>
+<style>
+  :root {
+    --bg: #0f1419; --panel: #1a2129; --panel-2: #212a33; --border: #2d3945;
+    --text: #d8e1ea; --muted: #8494a5; --accent: #4da3ff;
+    --ok: #3fb96f; --warn: #e0a83a; --err: #e05c5c; --purple: #a78bfa;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.6 "Segoe UI", "Microsoft YaHei", sans-serif; padding: 20px 24px 60px; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .sub { color: var(--muted); font-size: 12px; margin-bottom: 18px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; margin-bottom: 16px; }
+  .panel h2 { font-size: 14px; color: var(--accent); margin-bottom: 10px; display: flex; align-items: center; gap: 8px; }
+  .panel h2 .count { background: var(--panel-2); border-radius: 10px; padding: 0 8px; font-size: 12px; color: var(--muted); }
+  .panel h2 .spacer { flex: 1; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--muted); font-weight: 500; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  td { padding: 6px 8px; border-bottom: 1px solid #232d38; vertical-align: top; }
+  tr.clickable { cursor: pointer; }
+  tr.clickable:hover td { background: var(--panel-2); }
+  tr.selected td { background: #243244; }
+  .tag { display: inline-block; border-radius: 4px; padding: 0 6px; font-size: 12px; white-space: nowrap; }
+  .tag.run { background: #123a5c; color: #7cc0ff; }
+  .tag.done { background: #143d29; color: #6fd39a; }
+  .tag.insuf { background: #4a3a12; color: #ecc45c; }
+  .tag.fail { background: #4d1f1f; color: #f09a9a; }
+  .tag.sev-high { background: #4d1f1f; color: #f09a9a; }
+  .tag.sev-medium { background: #4a3a12; color: #ecc45c; }
+  .tag.sev-low { background: #143d29; color: #6fd39a; }
+  .mono { font-family: Consolas, "Courier New", monospace; font-size: 12px; }
+  .muted { color: var(--muted); }
+  .err-text { color: var(--err); }
+  button { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 4px 12px; cursor: pointer; font-size: 13px; }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button.primary { background: #1d4a7a; border-color: #2d6bb0; }
+  button:disabled { opacity: .5; cursor: default; }
+  input, select { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; font-size: 13px; }
+  label { color: var(--muted); font-size: 12px; display: block; margin-bottom: 2px; }
+  .form-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; margin-bottom: 10px; }
+  .detail-tree { font-size: 13px; }
+  .detail-tree dt { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  .detail-tree dd { margin-left: 0; }
+  .kv { display: grid; grid-template-columns: 110px 1fr; gap: 2px 10px; }
+  ul.evidence { padding-left: 18px; }
+  ul.evidence li { margin: 2px 0; }
+  .chain { background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; margin-top: 6px; }
+  .chain div { padding: 1px 0; }
+  .chain .s-SUCCESS { color: var(--ok); }
+  .chain .s-FAILED { color: var(--err); }
+  .chain .s-REJECTED { color: var(--warn); }
+  .empty { color: var(--muted); text-align: center; padding: 18px 0; }
+  #toast { position: fixed; right: 24px; bottom: 24px; background: var(--panel-2); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 8px; padding: 10px 16px; max-width: 420px; display: none; z-index: 9; }
+  .refresh-note { color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>AI 监控 Agent 控制台</h1>
+<div class="sub">告警 → Incident 聚合 → ReAct 取证 → 结构化诊断（只读展示，全部数据来自 /api/ai/* 查询端点）</div>
+
+<div class="grid">
+  <div class="panel">
+    <h2>当前告警（end_time IS NULL）<span class="count" id="incident-count">0</span><span class="spacer"></span>
+      <span class="refresh-note" id="refresh-note"></span><button onclick="refreshAll()">刷新</button></h2>
+    <div id="incidents"><div class="empty">加载中…</div></div>
+  </div>
+
+  <div class="panel">
+    <h2>手工触发诊断（演示 / 链路验证用，不需要真故障）</h2>
+    <div class="form-grid">
+      <div><label>service</label><input id="f-service" value="order-service" style="width:100%"></div>
+      <div><label>alertType（白名单内）</label>
+        <select id="f-alertType" style="width:100%"></select></div>
+      <div><label>severity</label>
+        <select id="f-severity" style="width:100%"><option>HIGH</option><option>MEDIUM</option><option>LOW</option></select></div>
+      <div><label>metricName（可选）</label><input id="f-metricName" placeholder="http_p99_latency" style="width:100%"></div>
+      <div><label>value</label><input id="f-value" value="2.1" style="width:100%"></div>
+      <div><label>threshold</label><input id="f-threshold" value="1.0" style="width:100%"></div>
+    </div>
+    <div><label>description</label><input id="f-description" value="控制台手工触发" style="width:100%"></div>
+    <div style="margin-top:10px"><button class="primary" id="btn-trigger" onclick="triggerDiagnosis()">创建诊断任务</button>
+      <span class="muted">没配 LLM Key 时任务会以 FAILED 结束并写明原因（SPEC §18：AI 失败 ≠ 监控失败）</span></div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>历史诊断<span class="count" id="history-count">0</span><span class="spacer"></span>
+    <button onclick="loadHistory()">刷新列表</button></h2>
+  <div id="history"><div class="empty">加载中…</div></div>
+</div>
+
+<div class="panel" id="detail-panel" style="display:none">
+  <h2>诊断详情 <span class="mono" id="detail-id" style="color:var(--muted)"></span></h2>
+  <div class="grid">
+    <div class="detail-tree" id="detail-task"></div>
+    <div class="detail-tree" id="detail-diagnosis"></div>
+  </div>
+  <h2 style="margin-top:14px">Tool Calling 轨迹<span class="count" id="trace-count">0</span></h2>
+  <div id="detail-chain"></div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const API = '/api/ai';
+let selectedIncidentId = null;
+
+function esc(s) {
+  return s == null ? '' : String(s).replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function toast(msg, isErr) {
+  const t = document.getElementById('toast');
+  t.style.borderLeftColor = isErr ? 'var(--err)' : 'var(--accent)';
+  t.innerHTML = esc(msg);
+  t.style.display = 'block';
+  clearTimeout(t._h);
+  t._h = setTimeout(() => t.style.display = 'none', 5000);
+}
+async function api(path, opts) {
+  const res = await fetch(API + path, opts);
+  let body = null;
+  try { body = await res.json(); } catch (e) { /* 非 JSON（如 500 空体） */ }
+  if (!res.ok) throw new Error((body && body.message) || (res.status + ' ' + res.statusText));
+  return body.data;
+}
+function statusTag(status) {
+  const map = { RUNNING:'run', COLLECTING_EVIDENCE:'run', ANALYZING:'run',
+                COMPLETED:'done', INSUFFICIENT_EVIDENCE:'insuf', FAILED:'fail' };
+  const label = { COMPLETED:'COMPLETED', INSUFFICIENT_EVIDENCE:'INSUFFICIENT',
+                  FAILED:'FAILED', RUNNING:'RUNNING', COLLECTING_EVIDENCE:'COLLECTING', ANALYZING:'ANALYZING' };
+  return `<span class="tag ${map[status] || 'run'}">${esc(label[status] || status || '?')}</span>`;
+}
+function fmtTime(s) { return s == null ? '—' : String(s).replace('T', ' ').substring(0, 19); }
+
+async function loadTools() {
+  try {
+    await api('/tools');
+    // alertType 白名单与告警规则逐条一致（validate_config 第 10.4 条）。
+    // 这里只列常用值；传错时服务端 400 会带出完整可用值列表并弹 toast。
+    document.getElementById('f-alertType').innerHTML =
+      ['LATENCY_HIGH','ERROR_RATE_HIGH','SERVICE_DOWN','DB_SLOW_QUERY',
+       'REDIS_LATENCY_HIGH','MQ_LAG_HIGH','OUTBOX_BACKLOG_HIGH','RECONCILE_INCONSISTENCY']
+      .map(t => `<option>${t}</option>`).join('');
+  } catch (e) { toast('工具白名单加载失败：' + e.message, true); }
+}
+
+async function loadIncidents() {
+  try {
+    const data = await api('/incidents?limit=50');
+    document.getElementById('incident-count').textContent = data.activeCount;
+    const el = document.getElementById('incidents');
+    if (!data.items.length) { el.innerHTML = '<div class="empty">当前没有未恢复的事故</div>'; return; }
+    el.innerHTML = '<table><thead><tr><th>incidentId</th><th>服务/类型</th><th>严重度</th><th>状态</th><th>开始时间</th><th>摘要</th></tr></thead><tbody>' +
+      data.items.map(it => `<tr class="clickable" onclick="showDetail('${esc(it.task.incidentId)}')">
+        <td class="mono">${esc(it.task.incidentId)}</td>
+        <td>${esc(it.task.serviceName)} / ${esc(it.task.alertType)}</td>
+        <td><span class="tag sev-${esc((it.task.severity || '').toLowerCase())}">${esc(it.task.severity || '—')}</span></td>
+        <td>${statusTag(it.task.status)}</td>
+        <td class="mono">${fmtTime(it.task.startTime)}</td>
+        <td class="muted">${esc(it.summary || '')}</td>
+      </tr>`).join('') + '</tbody></table>';
+  } catch (e) {
+    document.getElementById('incidents').innerHTML = `<div class="empty err-text">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+async function loadHistory() {
+  try {
+    const data = await api('/diagnosis/history?limit=30');
+    document.getElementById('history-count').textContent = data.count;
+    const el = document.getElementById('history');
+    if (!data.items.length) { el.innerHTML = '<div class="empty">还没有任何诊断记录 —— 用上面的表单手工触发一次，或等一条真实告警</div>'; return; }
+    el.innerHTML = '<table><thead><tr><th>incidentId</th><th>服务/类型</th><th>状态</th><th>根因</th><th>置信度</th><th>证据</th><th>创建时间</th><th>恢复时间</th></tr></thead><tbody>' +
+      data.items.map(it => `<tr class="clickable ${it.task.incidentId === selectedIncidentId ? 'selected' : ''}"
+          onclick="showDetail('${esc(it.task.incidentId)}')">
+        <td class="mono">${esc(it.task.incidentId)}</td>
+        <td>${esc(it.task.serviceName)} / ${esc(it.task.alertType)}</td>
+        <td>${statusTag(it.task.status)}</td>
+        <td>${it.rootCause == null ? '<span class="muted">（无结论' +
+            (it.failureReason ? '：' + esc(it.failureReason) : '') + '）</span>' : esc(it.rootCause)}</td>
+        <td class="mono">${it.confidence == null ? '<span class="muted">未提供</span>' : Number(it.confidence).toFixed(2)}</td>
+        <td class="mono">${it.evidenceCount}</td>
+        <td class="mono">${fmtTime(it.task.createdAt)}</td>
+        <td class="mono">${fmtTime(it.task.endTime)}</td>
+      </tr>`).join('') + '</tbody></table>';
+  } catch (e) {
+    document.getElementById('history').innerHTML = `<div class="empty err-text">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+async function showDetail(incidentId) {
+  selectedIncidentId = incidentId;
+  document.getElementById('detail-panel').style.display = 'block';
+  document.getElementById('detail-id').textContent = incidentId;
+  document.getElementById('detail-task').innerHTML = '<div class="empty">加载中…</div>';
+  document.getElementById('detail-diagnosis').innerHTML = '';
+  document.getElementById('detail-chain').innerHTML = '';
+  try {
+    const d = await api('/diagnosis/' + encodeURIComponent(incidentId));
+    renderTask(d);
+    renderDiagnosis(d);
+  } catch (e) {
+    document.getElementById('detail-task').innerHTML = `<div class="empty err-text">加载失败：${esc(e.message)}</div>`;
+    return;
+  }
+  try {
+    const t = await api('/diagnosis/' + encodeURIComponent(incidentId) + '/tools');
+    document.getElementById('trace-count').textContent = t.toolCallCount;
+    document.getElementById('detail-chain').innerHTML =
+      '<div class="chain">' + t.chain.map(line => {
+        const cls = /SUCCESS/.test(line) ? 's-SUCCESS' : /FAILED/.test(line) ? 's-FAILED' : /REJECTED/.test(line) ? 's-REJECTED' : '';
+        return `<div class="${cls}">${esc(line)}</div>`;
+      }).join('') + '</div>';
+  } catch (e) {
+    document.getElementById('detail-chain').innerHTML = `<div class="empty err-text">轨迹加载失败：${esc(e.message)}</div>`;
+  }
+  loadHistory();
+}
+
+function renderTask(d) {
+  const t = d.task;
+  document.getElementById('detail-task').innerHTML = '<dl class="kv">' +
+    `<dt>事故编号</dt><dd class="mono">${esc(t.incidentId)}</dd>` +
+    `<dt>服务 / 类型</dt><dd>${esc(t.serviceName)} / ${esc(t.alertType)}</dd>` +
+    `<dt>严重度</dt><dd><span class="tag sev-${esc((t.severity || '').toLowerCase())}">${esc(t.severity || '—')}</span></dd>` +
+    `<dt>状态</dt><dd>${statusTag(t.status)} <span class="muted">（end_time=${fmtTime(t.endTime)}，null = 故障未恢复）</span></dd>` +
+    `<dt>开始时间</dt><dd class="mono">${fmtTime(t.startTime)}</dd>` +
+    `<dt>告警条数</dt><dd class="mono">${t.alertCount}（Incident 聚合后）</dd>` +
+    `<dt>工具调用</dt><dd class="mono">${d.toolCallCount} 次 / 结论 ${d.resultCount} 份</dd>` +
+    '</dl>';
+}
+
+function renderDiagnosis(d) {
+  const el = document.getElementById('detail-diagnosis');
+  if (!d.diagnosis) { el.innerHTML = '<div class="empty">尚无诊断结论（诊断未结束或未落库）</div>'; return; }
+  const r = d.diagnosis;
+  const raw = r.rawResult || {};
+  const tokens = (raw.promptTokens != null || raw.completionTokens != null)
+    ? `${raw.promptTokens ?? '—'} + ${raw.completionTokens ?? '—'}`
+    : '<span class="muted">未记录</span>';
+  el.innerHTML = '<dl class="kv">' +
+    `<dt>根因</dt><dd>${r.rootCause == null ? '<span class="err-text">（无根因：' + esc(raw.failure || '未产出') + '）</span>' : esc(r.rootCause)}</dd>` +
+    `<dt>置信度</dt><dd class="mono">${r.confidence == null ? '未提供（解释不了就存 NULL，绝不存 0）' : Number(r.confidence).toFixed(2)}</dd>` +
+    `<dt>影响</dt><dd>${esc(r.impact ? JSON.stringify(r.impact) : '—')}</dd>` +
+    `<dt>证据（${r.evidenceCount}）</dt><dd><ul class="evidence">${(r.evidence || []).map(x => `<li>${esc(x)}</li>`).join('')}</ul></dd>` +
+    `<dt>建议</dt><dd><ul class="evidence">${(r.suggestions || []).map(x => `<li>${esc(x)}</li>`).join('')}</ul></dd>` +
+    `<dt>模型 / 用量</dt><dd class="mono">${esc(raw.model || '—')}，token ${tokens}，LLM ${raw.llmCalls ?? '—'} 轮 / 工具 ${raw.toolCalls ?? '—'} 次</dd>` +
+    `<dt>结论时间</dt><dd class="mono">${fmtTime(r.createdAt)}</dd>` +
+    '</dl>';
+}
+
+async function triggerDiagnosis() {
+  const btn = document.getElementById('btn-trigger');
+  btn.disabled = true;
+  const body = {
+    service: document.getElementById('f-service').value.trim(),
+    alertType: document.getElementById('f-alertType').value,
+    severity: document.getElementById('f-severity').value,
+    metricName: document.getElementById('f-metricName').value.trim() || null,
+    value: parseFloat(document.getElementById('f-value').value),
+    threshold: parseFloat(document.getElementById('f-threshold').value),
+    description: document.getElementById('f-description').value.trim()
+  };
+  try {
+    const res = await fetch(API + '/diagnosis', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const json = await res.json();
+    if (!res.ok || !json.success) throw new Error(json.message || (res.status + ' ' + res.statusText));
+    const incidentId = json.data && (json.data.incidentId || json.data.task && json.data.task.incidentId);
+    toast('已创建诊断任务：' + (incidentId || JSON.stringify(json.data)));
+    refreshAll();
+    if (incidentId) showDetail(incidentId);
+  } catch (e) {
+    toast('创建失败：' + e.message, true);
+  } finally { btn.disabled = false; }
+}
+
+function refreshAll() { loadIncidents(); loadHistory(); }
+
+refreshAll();
+loadTools();
+setInterval(loadIncidents, 30000);
+document.getElementById('refresh-note').textContent = '当前告警每 30s 自动刷新';
+</script>
+</body>
+</html>

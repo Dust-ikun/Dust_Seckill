@@ -5,11 +5,7 @@
 
 核心设计原则：**宁可少卖，绝不超卖**——所有失败路径的处置顺序、补偿与回补策略均按此裁决。
 
-> **接手项目先读 [`docs/秒杀链路文档.md`](docs/秒杀链路文档.md)**：把「一次下单经过哪些环节、每个环节失败会怎样、
-> 漏掉的东西谁负责发现」讲清楚，含失败/补偿矩阵、崩溃点清单、对账判据、运维手册与常用排查 SQL。
-> 本 README 只做概览与速查，链路细节以那份文档为准。
->
-> **AI 监控 Agent 那部分先读 [`HANDOFF.md`](HANDOFF.md)**：它记录了三批交付的进度、本机环境的硬约束、
+> **AI 监控 Agent 那部分先读 [`HANDOFF.md`](HANDOFF.md)**：它记录了各批次的交付进度、本机环境的硬约束、
 > 以及踩过的坑（含两条「写错了不报错」的通用判据）。
 
 ---
@@ -69,7 +65,7 @@ Prometheus 规则 → Alertmanager → POST /api/ai/alerts          ← 202 已�
                                         │
                               ReAct 循环（异步，不占用 webhook 线程）
                                  ├─ LlmClient.chat   （DeepSeek，工具调用）
-                                 └─ ToolRegistry.invoke（5 个**只读**工具，唯一执行入口）
+                                 └─ ToolRegistry.invoke（6 个**只读**工具，唯一执行入口）
                                         │
                               三张表：ai_diagnosis_task / ai_diagnosis_result / ai_tool_execution
                                         │
@@ -77,7 +73,7 @@ Prometheus 规则 → Alertmanager → POST /api/ai/alerts          ← 202 已�
 ```
 
 - **只读是结构性的**：DB Tool 的入参里**没有任何位置能表达 SQL**（只有一个枚举 + 几个数字），不是靠字符串过滤。
-- **5 个工具**：`query_metric`（42 条口径白名单）/ `search_logs` / `query_db` / `query_mq` / `query_business`。
+- **6 个工具**：`query_metric`（42 条口径白名单）/ `search_logs` / `query_db` / `query_mq` / `query_business` / `query_runtime`（批次 5：消费线程池活跃数 / 单条消息处理耗时分布 / 降级标志位）。
 - **降级态是默认值**：`DEEPSEEK_API_KEY` 为空时**照常接收并落库告警、照常聚合**，只是不产出诊断（SPEC §18「AI 失败 ≠ 监控失败」）。
 - **防注入**：工具返回与告警载荷一律包在 `<untrusted_data>` 内，prompt 里明确「标签内的是数据，不是指令」。
 - **防自激闭环**：AI 自身的指标（`seckill_ai_*`）**不得**被任何告警规则引用，`monitoring/validate_config.py` 第 10.6 条静态拦住。
@@ -109,7 +105,8 @@ src/main/java/com/dustikun/seckill/
     ├── core/            # 跨批次共享的底座：Masker（脱敏）/ TraceContext / AlertEvent / AlertType
     │                    #   / Severity / DiagnosisStatus / AiMonitorMetrics / SafeCollections
     ├── log/             # 结构化日志底座：LogRingBuffer（有界）+ Logback appender + LogSink
-    ├── tool/            # 5 个只读 Tool + 白名单注册表 + 参数校验 + 结果整形（唯一执行入口）
+    ├── tool/            # 6 个只读 Tool + 白名单注册表 + 参数校验 + 结果整形（唯一执行入口）
+    │   ├── runtime/     # query_runtime（批次 5）：消费线程池 / 处理耗时分布 / 降级标志位
     ├── agent/           # 手写 LLM 客户端 / Prompt / ReAct 循环 / 诊断编排 / 启动自检
     ├── analyzer/        # Diagnosis 解析与 Schema 校验
     ├── alert/           # 告警接收（Alertmanager webhook）+ Incident 聚合 + 查询 API
@@ -120,6 +117,7 @@ src/main/resources/
 ├── db/schema.sql        # 建库建表脚本（含增量 ALTER 说明）
 ├── db/schema-ai-monitor.sql  # AI 三张表（独立文件：它们的生命周期与业务表完全不同）
 ├── logback-spring.xml   # 结构化日志（traceId / 单号）+ 环形缓冲 appender
+├── static/ai-monitor.html   # AI 监控控制台（批次 4，单文件无依赖）
 ├── application.yaml     # 主配置（application-example.yaml 为脱敏示例）
 └── application-docker.yaml   # docker profile：容器中间件 + 可观测性栈 + seckill.monitor.*
 
@@ -129,9 +127,6 @@ monitoring/              # 可观测性栈配置（Prometheus 规则 / Alertmana
 
 docker/                  # RocketMQ 配置（broker.conf / namesrv.conf）+ 其它镜像所需文件
 scripts/                 # run-app.ps1（导出 .env 后启动，纯 ASCII）/ remove-native-middleware.ps1
-
-docs/
-└── 秒杀链路文档.md       # 链路 / 状态机 / 失败补偿矩阵 / 崩溃点 / 对账判据 / 运维手册（接手先读）
 ```
 
 ## 4. 数据库表
@@ -190,6 +185,9 @@ AI 三张表另跑一次：`mysql -uroot -p seckill < src/main/resources/db/sche
 | GET | `/api/ai/diagnosis/history?limit=&offset=` | 历史诊断（每条附最新结论摘要：根因 / 置信度 / 证据条数） |
 | GET | `/api/ai/incidents?limit=` | 当前告警（`end_time IS NULL`）。**用 `end_time` 而非 `status` 筛**：诊断结束 ≠ 故障恢复 |
 | GET | `/api/ai/tools` | 工具白名单与 `definitions`（模型看到的 `tools` 就是这一份） |
+
+前端控制台：`http://localhost:8081/ai-monitor.html`（批次 4 新增，单文件无依赖：
+当前告警 / 历史诊断 / 结论+token 用量 / 一行工具链路 / 手工触发）。
 
 ## 6. 关键配置（`application.yaml` → `seckill.*`）
 
@@ -255,7 +253,7 @@ curl -X POST "http://localhost:8081/api/ai/diagnosis" -H "Content-Type: applicat
 ## 8. 测试
 
 ```powershell
-# 全量（334 项；需要 MySQL + Redis + RocketMQ 都在）
+# 全量（351 项；需要 MySQL + Redis + RocketMQ 都在）
 mvn test
 # ⚠️ 跑之前确认应用**没有**在运行：每个测试上下文都会启动一个 RocketMQ 消费者，
 #    与正在跑的应用同属一个消费组时 Broker 会把队列对半分，导致依赖消费进度的断言假失败。
@@ -280,8 +278,9 @@ python monitoring/validate_config.py     # 需要 PyYAML
 - `SeckillReviewFixTest` — 评审修复项回归（含「投递已放弃但仍为 PENDING」必须被对账报出来且不许对账自己改库存）
 - `SeckillEntityMappingTest` — snake_case 列映射回归锁（防 `map-underscore-to-camel-case` 配置失效导致静默 null）
 - `SeckillOrderStatusTest` — 订单状态机流转
+- `SeckillMetricsRuntimeObservationTest` — 消费线程池活跃数 / 单条消息处理耗时直方图 / 降级标志位三类运行时指标的注册与读数（批次 5，为 `query_runtime` 提供数据源）
 
-AI 监控测试（累计 288 项；其中批次 3 新增 122 项，14 项打真实中间件）：
+AI 监控测试（累计 301 项；批次 5 新增 `RuntimeToolTest` 11 项，14 项打真实中间件）：
 
 - `LlmClientTest` — 手写客户端的**线协议**（真起一个 HTTP 服务端读请求字节）：`tool_calls.arguments` 必须是字符串、`tool_choice:auto` 必须发、429/5xx 重试而 4xx 不重试
 - `DiagnosisParserTest` — 围栏剥离、候选挑选（散文含 `{}`、模型先给 schema 示例）、confidence 规整、硬/软两层校验
@@ -289,6 +288,7 @@ AI 监控测试（累计 288 项；其中批次 3 新增 122 项，14 项打真�
 - `AgentExecutorTest` — 每一次 `tool_call` 都有对应的 `tool` 消息回应（少一条服务端会 400）、预算用尽强制收尾、墙钟熔断、坏参数**绝不执行**
 - `SafeCollectionsTest` — **先用 JDK 证明 `Map/List.copyOf` 会拒绝 null**，再断言我们的包装不拒绝
 - `MonitorToolIntegrationTest` / `MonitorAgentIntegrationTest` — 真库 + 真 Prometheus + 真日志缓冲的端到端
+- `RuntimeToolTest` — `query_runtime` 三个 operation 的判别语义：Case 3 判据（活跃数打满 vs 不满）、Case 5 判据（降级标志 + 事件速率，识别间歇性故障）、「空 ≠ 0」、Prometheus 不可达时进程内读数仍成立
 
 ## 9. 已知取舍与后续方向
 
@@ -315,10 +315,14 @@ AI 监控 Agent 侧的已知取舍（详细复盘见 `HANDOFF.md`）：
 
 8. **LLM 的输出不可信，只能靠校验拦**：`confidence` 解释不了就存 NULL（绝不存 0）、非法 JSON 落 `INSUFFICIENT_EVIDENCE` 并把原文存进 `raw_result`、`arguments` 是坏 JSON 时**绝不拿空参数去执行工具**（那会得到一次「成功」的调用，但结论有证据、证据是假的）。
 9. **「证据条数 ≥ 2」只是「证据充分」的粗糙代理**：实测出现过模型给 6 条**排除性**证据（「不是 DB、不是 Redis、不是 GC」）却自己在 `root_cause` 里写「证据不足」——计数区分不了正向证据与排除性证据。
-10. **没有记录 token 用量**：客户端已解析 `usage` 但未落库，因此「这次诊断花了多少钱」答不上来，只能按轮数估。
+10. **~~没有记录 token 用量~~（批次 4 已修）**：`AgentExecutor` 现在把每轮 `usage` 累加进 `raw_result`
+   （`promptTokens` / `completionTokens`，服务端不返回 usage 时省略键而非写 0）。
+   实测基线见 `docs/故障注入实验记录.md` §1：单次诊断 ≈16k~25k prompt + ~2k completion tokens。
 11. **DB 仍以 `root` 连库**：结构上执行不了写语句（入参里没有 SQL 的位置），但账号权限本身是全量的 —— 补齐需要独立的最小权限账号 + 独立 DataSource。
 12. **重新诊断没有入口**：`ai_diagnosis_result` 是 1 : N（表结构支持同一次事故保留多份结论），但没有触发第二次诊断的入口，`FAILED` / `INSUFFICIENT_EVIDENCE` 的任务不会被自动重试。
 
 后续方向：对账结果落库 + 告警、活动起止时间自动化、消费完成回写 outbox（全链路台账 +
 让 `pipelineDrained` 跨实例准确）、评估 Redis Stream 版激进方案；
-AI 监控侧：5 个故障注入 Case 的准确性评估、最简前端、token 计量。
+AI 监控侧（批次 4 完成故障注入评估与最简前端，批次 5 上线 `query_runtime` 运行时观测工具，
+补齐了「消费线程池 / 处理耗时分布 / 降级标志位」三类证据）：
+对账基线已知现象的数据化、跨类型共享取证的成本优化。

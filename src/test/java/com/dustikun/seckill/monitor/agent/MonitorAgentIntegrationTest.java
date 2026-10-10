@@ -122,7 +122,7 @@ class MonitorAgentIntegrationTest {
     // ================================================================ 装配
 
     @Test
-    @DisplayName("★ 整批 Bean 装配得起来：白名单 5 个、五个工具都能通过注册表调用")
+    @DisplayName("★ 整批 Bean 装配得起来：白名单 6 个（含批次 5 的 query_runtime）、每个都能通过注册表调用")
     void wiringIsComplete() {
         assertNotNull(agentExecutor);
         assertNotNull(diagnosisService);
@@ -130,8 +130,8 @@ class MonitorAgentIntegrationTest {
         assertNotNull(queryService);
         assertNotNull(payloadParser);
         assertNotNull(alertWebhookController);
-        assertEquals(5, registry.size(), "白名单：" + registry.names());
-        assertEquals(5, registry.definitions().size());
+        assertEquals(6, registry.size(), "白名单：" + registry.names());
+        assertEquals(6, registry.definitions().size());
 
         // 每个工具都真的调一次：证明「装配对了」而不是「Bean 建出来了」。
         // 参数全部是各工具的最小合法输入；断言只看「有没有经过整形出口」，
@@ -498,9 +498,9 @@ class MonitorAgentIntegrationTest {
         Result<Map<String, Object>> result = diagnosisController.toolDefinitions();
 
         assertTrue(result.isSuccess());
-        assertEquals(5, result.getData().get("count"));
+        assertEquals(6, result.getData().get("count"));
         assertEquals(registry.names(), result.getData().get("names"));
-        assertEquals(5, ((List<?>) result.getData().get("definitions")).size());
+        assertEquals(6, ((List<?>) result.getData().get("definitions")).size());
     }
 
     // ================================================================ 辅助

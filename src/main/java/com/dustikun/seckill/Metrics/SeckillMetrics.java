@@ -4,11 +4,14 @@ import com.dustikun.seckill.Common.result.ReconcileReport;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import org.springframework.stereotype.Component;
 
 import java.util.EnumMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -64,6 +67,38 @@ import java.util.concurrent.atomic.AtomicLong;
 @Component
 public class SeckillMetrics {
 
+    // ================================================================ 运行时观测的指标名（批次 5）
+    //
+    // 【为什么把名字做成 public 常量】RuntimeTool（query_runtime）要按 PromQL 去
+    // Prometheus 查这些序列。名字若在两处各写一遍，必然分叉 —— 而分叉的表现正是
+    // 本项目最熟悉的那类事故：「序列不存在」被读成「没有异常」。
+    // Micrometer 的 Prometheus 命名约定：点分名 → 下划线，Timer 追加基础单位 seconds，
+    // 因此 seckill.consume.process 渲染为 seckill_consume_process_seconds_{count,sum,bucket}。
+
+    /** 消费并发度（当前正在处理的消息条数，等价于消费线程池的活跃线程数） */
+    public static final String METRIC_CONSUME_ACTIVE = "seckill.consume.active.threads";
+
+    /** 单条消息处理耗时直方图（consumeOne 的完整路径，含重试判定与失败处置） */
+    public static final String METRIC_CONSUME_PROCESS = "seckill.consume.process";
+
+    /** 降级标志位：最近 5 分钟内发生过 Redis 故障降级则为 1，否则为 0 */
+    public static final String METRIC_DEGRADATION_ACTIVE = "seckill.degradation.active";
+
+    /** 降级事件计数（既有指标，RuntimeTool 读它的速率） */
+    public static final String METRIC_REQUEST_DEGRADED = "seckill.request.degraded";
+
+    /**
+     * 降级标志位的「活跃」判定窗口。
+     * <p>
+     * 【为什么是时间窗而不是显式的开/关状态机】Redis 故障降级是<b>按请求</b>触发的：
+     * 每个撞上 Redis 故障的请求各自回落 MySQL，而系统里没有「Redis 已恢复」这个事件
+     * 可供监听（探测恢复要往请求路径里加健康检查，那是主链路侵入，违背旁路纪律）。
+     * 因此标志位取「最近一次降级事件距今是否在窗口内」这个诚实的近似：
+     * 它回答「最近有没有在降级」，而不是「此刻 Redis 是否仍不可用」——
+     * 后者本工具不承诺，交给 Agent 结合 Redis 延迟类指标自行交叉验证。
+     */
+    public static final long DEGRADATION_ACTIVE_WINDOW_MILLIS = 5 * 60 * 1000L;
+
     // ================================================================ 请求侧
 
     private final Counter queued;
@@ -115,6 +150,34 @@ public class SeckillMetrics {
 
     /** 待补偿任务未结案数 */
     private final AtomicLong compensatePending = new AtomicLong();
+
+    // ================================================================ 运行时观测（批次 5）
+    //
+    // 【为什么放进 SeckillMetrics 而不是新建一个类】本类的定位就是「指标的唯一出口」，
+    // 消费者已在注入它；观测活跃数与耗时只需要在既有出口上多挂三个仪表，
+    // 而不是再造一个与它平行的计数出口 —— 那正是本类注释里明令禁止的形态。
+
+    /**
+     * 当前正在被处理的消息条数。
+     * <p>
+     * 消费端 {@code consumeMessage} 由 RocketMQ 的消费线程池调用，因此
+     * 「正在处理的消息条数」与「线程池的活跃线程数」一一对应 —— 这是 Case 3 里
+     * 模型缺的那个证据：拿它和 lag 增长交叉，「线程数不足」与「单条变慢」就能区分
+     * （活跃数打满 → 容量瓶颈；活跃数不满 → 单条耗时瓶颈）。
+     */
+    private final AtomicInteger consumeActive = new AtomicInteger();
+
+    /** 活跃数的进程内峰值。单看瞬时值会被「恰好采到空隙」骗过，峰值能回答「窗口内打满过没有」 */
+    private final AtomicLong consumeActiveMax = new AtomicLong();
+
+    /** 单条消息处理耗时直方图。{@code publishPercentileHistogram()} 保证 _bucket 直方图一定被发布 */
+    private final Timer consumeProcessTimer;
+
+    /**
+     * 最近一次 Redis 故障降级的时刻（毫秒时间戳）。从未发生过时为 0。
+     * <p>由 {@link #onDegraded()} 写入；volatile 保证 Gauge 读取侧的可见性。
+     */
+    private volatile long lastDegradedAtMillis = 0L;
 
     // ================================================================ 对账侧
 
@@ -223,6 +286,27 @@ public class SeckillMetrics {
         Gauge.builder("seckill.compensate.pending", compensatePending, AtomicLong::doubleValue)
                 .description("status=PENDING 的待补偿任务条数：还没追回来的库存账")
                 .register(registry);
+
+        // ---------------- 运行时观测（批次 5） ----------------
+        // 【直方图发布必须写在代码里，不能走 management.metrics.* 配置】
+        // 那个前缀曾经整段被静默忽略（HANDOFF §3 第一条「配置被静默忽略」的教训），
+        // 导致 P99 三条记录规则全部空序列、告警永不响。写在 Timer 构建器上不依赖
+        // 任何 YAML，配置失效这一类问题在这里结构上不可能发生。
+        this.consumeProcessTimer = Timer.builder(METRIC_CONSUME_PROCESS)
+                .description("单条消息从开始消费到返回结论的耗时（含确认/重试判定/失败处置，不含 MQ 框架开销）")
+                .publishPercentileHistogram()
+                .publishPercentiles(0.5, 0.95, 0.99)
+                .register(registry);
+        Gauge.builder(METRIC_CONSUME_ACTIVE, consumeActive, AtomicInteger::doubleValue)
+                .description("当前正在处理的消息条数（≈ 消费线程池的活跃线程数）")
+                .register(registry);
+        // 降级标志位：不是 Redis 健康探测，语义是「最近 5 分钟内发生过降级事件」。
+        // 见 DEGRADATION_ACTIVE_WINDOW_MILLIS 的注释 —— 它承诺什么、不承诺什么。
+        Gauge.builder(METRIC_DEGRADATION_ACTIVE, this,
+                        metrics -> (System.currentTimeMillis() - metrics.lastDegradedAtMillis
+                                < DEGRADATION_ACTIVE_WINDOW_MILLIS && metrics.lastDegradedAtMillis > 0) ? 1.0 : 0.0)
+                .description("降级标志位：最近一次 Redis 故障降级距今是否在 5 分钟窗口内（1=是）")
+                .register(registry);
     }
 
     // ================================================================ 请求侧
@@ -234,6 +318,7 @@ public class SeckillMetrics {
 
     /** Redis 不可用、触发降级 */
     public void onDegraded() {
+        lastDegradedAtMillis = System.currentTimeMillis();
         degraded.increment();
     }
 
@@ -308,6 +393,58 @@ public class SeckillMetrics {
 
     public void onConsumeStockRestored() {
         consumeStockRestored.increment();
+    }
+
+    // ================================================================ 运行时观测（批次 5）
+
+    /**
+     * 一条消息开始被消费线程处理。调用点是消费者的 {@code consumeOne} 入口 ——
+     * 每条消息各计一次，因此活跃数与「正在处理的消息条数」一致。
+     */
+    public void onConsumeBegin() {
+        int now = consumeActive.incrementAndGet();
+        consumeActiveMax.updateAndGet(prev -> Math.max(prev, now));
+    }
+
+    /**
+     * 一条消息处理结束（无论结局：确认 / 重复 / 失败 / 重试）。
+     * <p>必须在 finally 里调用：漏掉 dec 会让活跃数单调上涨，永远回不到 0 ——
+     * 那是一个看起来像「线程池打满」的假信号。
+     *
+     * @param tookNanos 本条消息的处理耗时（纳秒）。由调用方用 {@code System.nanoTime()} 差值得到
+     */
+    public void onConsumeEnd(long tookNanos) {
+        consumeActive.decrementAndGet();
+        consumeProcessTimer.record(tookNanos, TimeUnit.NANOSECONDS);
+    }
+
+    /** 当前活跃数（进程内实时读数，单实例口径） */
+    public int consumeActiveThreads() {
+        return consumeActive.get();
+    }
+
+    /** 进程启动以来的活跃数峰值（回答「窗口内打满过没有」，不被瞬时空隙骗过） */
+    public long consumeActiveThreadsMax() {
+        return consumeActiveMax.get();
+    }
+
+    /** 单条耗时直方图本体，供 RuntimeTool 直接读 count/mean/max/percentiles */
+    public Timer consumeProcessTimer() {
+        return consumeProcessTimer;
+    }
+
+    /**
+     * 降级标志位（进程内实时读数）：最近一次降级事件距今是否在窗口内。
+     * <p>与 {@code seckill.degradation.active} 这个 Gauge 是同一个判定，两个出口读同一状态。
+     */
+    public boolean degradationActive() {
+        return lastDegradedAtMillis > 0
+                && System.currentTimeMillis() - lastDegradedAtMillis < DEGRADATION_ACTIVE_WINDOW_MILLIS;
+    }
+
+    /** 最近一次降级事件的毫秒时间戳；从未发生过时为 0 */
+    public long lastDegradedAtMillis() {
+        return lastDegradedAtMillis;
     }
 
     // ================================================================ 补偿侧

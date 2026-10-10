@@ -52,7 +52,12 @@ jmeter.log
 #   （配套约定：压测脚本与结论请写进 docs/ 或 loadtest/README.md，
 #     需要长期保留的内容不要留在 loadtest/ 里。）
 loadtest/
+logs/
 *.log
+
+### 一次性修复脚本与本地文档，不纳入版本控制 ###
+tools/fix_swallowed_keys.py
+docs/秒杀链路文档.md
 
 src/main/resources/application.yaml
 

@@ -123,6 +123,36 @@ class AgentExecutorTest {
     }
 
     @Test
+    @DisplayName("★ token 用量跨全部 LLM 轮次累加并写进 raw_result（批次 4 的成本统计口径）")
+    void tokenUsageIsAccumulatedIntoRawResult() {
+        // 三轮：两次工具轮各 100/20，收尾轮 100/50 → 合计 prompt=300、completion=90。
+        // 脚本响应自带 usage（toolCall=100/20、finalAnswer=100/50），恰好可做加法验算。
+        ScriptedLlmClient llm = ScriptedLlmClient.of(
+                ScriptedLlmClient.toolCall("c1", "query_metric", "{\"metric\":\"http_p99\"}"),
+                ScriptedLlmClient.toolCall("c2", "search_logs", "{\"keyword\":\"timeout\"}"),
+                ScriptedLlmClient.finalAnswer(VALID_DIAGNOSIS));
+
+        AgentRunResult result = fixture(llm, 10, 2).executor.run(7L, "INC-20261009-001", ALERT, null);
+
+        assertEquals(DiagnosisStatus.COMPLETED, result.status(), result.summarize());
+        assertEquals(300, result.rawResult().get("promptTokens"));
+        assertEquals(90, result.rawResult().get("completionTokens"));
+    }
+
+    @Test
+    @DisplayName("服务端不返回 usage 时省略 token 键（null ≠ 0：缺失不能冒充免费）")
+    void missingUsageOmitsTokenKeysInsteadOfWritingZero() {
+        ScriptedLlmClient llm = ScriptedLlmClient.of(
+                new LlmResponse(VALID_DIAGNOSIS, List.of(), "stop", null, null, "{}"));
+
+        AgentRunResult result = fixture(llm, 10, 2).executor.run(7L, "INC-20261009-001", ALERT, null);
+
+        assertEquals(DiagnosisStatus.COMPLETED, result.status(), result.summarize());
+        assertFalse(result.rawResult().containsKey("promptTokens"), "缺失的 usage 不得写成 0");
+        assertFalse(result.rawResult().containsKey("completionTokens"), "缺失的 usage 不得写成 0");
+    }
+
+    @Test
     @DisplayName("★ 每一次 tool_call 都有对应的 role=tool 消息回应，且 tool_call 的 id 原样回灌")
     void everyToolCallGetsAResponse() {
         ScriptedLlmClient llm = ScriptedLlmClient.of(

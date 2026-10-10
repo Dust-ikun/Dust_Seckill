@@ -6,7 +6,9 @@
 > 本文件把那些信息固化下来，让新会话能用一分钟恢复上下文。
 >
 > **维护约定**：每完成一个批次就更新「当前进度」与「下一步」两节。
-> 最后更新：2026-10-09（**批次 3 完成**：手写 DeepSeek 客户端 + ReAct 循环 + 告警接入 + 三个查询 API）
+> 最后更新：2026-10-10（**批次 5 完成：运行时观测 Tool**——`query_runtime` 上线，
+> 补齐 Case 3/5 实测暴露的三类证据缺口：消费线程池活跃数 / 单条消息处理耗时分布 / 降级标志位；
+> 白名单 5 → 6，全量测试 351 项全绿）
 
 ---
 
@@ -18,14 +20,20 @@
 **已完成**：中间件 Docker 化 + 完整可观测性栈 + AI 监控表结构 + 全部配置校验
 + 批次 1（日志结构化 + Logs Tool 底座 + RocketMQ 指标 + 健康基线）
 + 批次 2（Tool 层：白名单注册表 + 5 个只读 Tool + 参数校验 + 结果上限 + 启动自检）
-+ **批次 3（Agent 编排：LLM 客户端 + ReAct 循环 + Diagnosis 解析 + 告警接入 + Incident 聚合
-+ Tool Trace 落库 + 查询 API，并已用真实 DeepSeek 跑通三次真实诊断）**。
-**未开始**：批次 4（故障注入 + 前端）。
++ 批次 3（Agent 编排：LLM 客户端 + ReAct 循环 + Diagnosis 解析 + 告警接入 + Incident 聚合
++ Tool Trace 落库 + 查询 API，已用真实 DeepSeek 跑通诊断）
++ **批次 4（token 用量落库 + 最简前端 `static/ai-monitor.html` + 5 个故障注入 Case 实测评估，
+  实验全记录在 `docs/故障注入实验记录.md`——含对手册的三处修正，动故障注入前必读）**
++ **批次 5（运行时观测 Tool `query_runtime`：消费线程池活跃数 / 单条消息处理耗时分布 /
+  降级标志位。三类证据直接对应实验记录 §3.5 的能力缺口——Case 3 想区分
+  「线程数不足 vs 单条变慢」、Case 5 想确认「降级确实被触发」，缺的就是它们）**。
+**未开始**：实验记录 §3 剩余改进项（同一故障窗口的跨类型共享取证、对账结论的 baseline 标签）；
+两者都改变既有语义，需单独评估。
 
 **恢复环境的命令（复制粘贴即可）**：
 
 ```powershell
-cd D:\Java_Project\Dust-ikun_seckillv3
+cd D:\Java_Project\Dust-ikun_seckillv3_anoagent
 docker compose up -d mysql redis rocketmq-namesrv rocketmq-broker
 docker compose --profile observability up -d
 docker compose ps
@@ -96,12 +104,16 @@ docker compose ps
 | **查询 API** | `monitor/alert/DiagnosisController.java` | SPEC §21 三个端点 + 活跃事故 + 工具白名单 |
 | **AI 自身指标** | `monitor/core/AiMonitorMetrics.java` | 3 个 Counter；**静态禁止**被告警规则引用（防自激闭环） |
 | **允许 null 的不可变集合** | `monitor/core/SafeCollections.java` | ★ 本批次踩了 3 次 `Map/List.copyOf` 拒绝 null；读完它的注释再用 |
+| **token 用量落库（批次 4）** | `monitor/agent/AgentExecutor.java` | 跨全部 LLM 轮次累加 usage 写进 `raw_result`；**服务端不返回 usage 时省略键**（null ≠ 0）；2 项新单测 |
+| **最简前端（批次 4）** | `src/main/resources/static/ai-monitor.html` | 单文件无依赖：当前告警 / 历史诊断 / 详情+token 用量 / 一行工具链路 / 手工触发；`http://localhost:8081/ai-monitor.html` |
+| **故障注入实验全记录（批次 4）** | **`docs/故障注入实验记录.md`** | **做故障注入或改告警阈值前必读**：5 个 Case 的注入/结论/置信度/token 成本 + 手册三处修正 |
+| **运行时观测 Tool（批次 5）** | `monitor/tool/runtime/RuntimeTool.java` + `SeckillMetrics` 新增仪表 + 消费者入口/出口旁路观测 | 白名单 5 → 6（`query_runtime`，三个 operation）；单测 15 项（`RuntimeToolTest` + `SeckillMetricsRuntimeObservationTest`）；改动全部只读、不改业务语义 |
 
 ### 关键验证结果（这些数字是新会话最需要知道的）
 
 ```
-mvn -o -B test                    → Tests run: 334, Failures: 0, Errors: 0  ✅
-                                    （批次 1 是 93，批次 2 是 212）
+mvn -o -B test                    → Tests run: 351, Failures: 0, Errors: 0  ✅
+                                    （批次 1 是 93，批次 2 是 212，批次 3 是 334，批次 4 是 336；批次 5 +15 运行时观测单测）
 monitoring/validate_config.py     → 67 项检查，0 错误 0 警告              ✅
 应用端到端（容器中间件）            → 预热 936 → 下单 QUEUED → SUCCESS
                                      一行 grep 单号 → 请求侧 + 消费侧两行      ✅
@@ -114,6 +126,10 @@ Agent 启动自检（批次 3 新增 4 项）  → LLM 客户端就绪（或降�
                                      三张表的列名探测 + AI 指标不得被告警引用的提醒 ✅
 Prometheus 指标名索引              → 553 个名字                            ✅
 真实 LLM 端到端（批次 3）           → 3 次真实诊断全部跑通，见 §1 与批次 3 文档 §4 ✅
+故障注入 5 Case（批次 4）           → 主告警定位 4 ✅ + 1 ⚠️，0 错误，0 例 INSUFFICIENT_EVIDENCE；
+                                     单次诊断 ≈16k~25k prompt + ~2k completion tokens；
+                                     resolved→end_time 写入在真实 Alertmanager 下验证通过   ✅
+最简前端（批次 4）                  → /ai-monitor.html 200，五个查询端点全部可用           ✅
 本机 shell                         → pwsh 7.6.6 / Core                      ✅
 本机原生中间件                      → 已全部移除，只剩 Docker                ✅
 ```
@@ -381,6 +397,45 @@ curl.exe -X POST "http://localhost:8081/seckill/preheat?stockId=1"
 > 真实 LLM + 真实 Alertmanager 的首跑里才暴露的，而且它们都是**批次内部已经识别过的错误、
 > 又在别处犯了一次**。知道一个道理，与在每一处都做到，中间隔着很远。
 
+### 批次 4 新增的教训（全部来自真实故障注入，详见 `docs/故障注入实验记录.md`）
+
+| # | 教训 | 判据 |
+|---|---|---|
+| 1 | **手册里的命令要逐字验证后才可信**：Case 5 的注入命令用了错误的 Redis 键名（`seckill:stock:1`，真实键是 `seckill:stock:{1}`），静默无效；Case 3 的「停 Broker」根本不可能触发 `MqConsumeLagGrowing`（sent 与 confirmed 同时归零，表达式恒 0） | 文档里的「触发方式」注释与手册命令，动手前先在出口上验证一次；无效注入比无注入更浪费时间 |
+| 2 | **告警阈值隐含的硬件假设要实测**：`MqConsumeLagGrowing > 5/s` 假设消费能力是 ~5/s 量级，实测单消费线程 ≈200+/s（每条确认只是一次索引 UPDATE）——手册的方式二在本机永远不触发。要人为制造滞后只能压单条处理耗时（如 orders UPDATE 触发器 SLEEP） | 对任何「>N 条/秒」类阈值，先测一次真实组件吞吐，判断 N 是否可达 |
+| 3 | **rate(...[5m]) 会稀释短促突发**：32/s 持续 2.5 分钟的突发，在 5m 窗口平均后只剩 ~16/s；`for: Nm` 再叠一层持续时间要求。负载必须持续到「告警 firing + for 窗口 + group_wait + 诊断」全部结束 | 压测时长 ≥ 5m 窗口 + 2×for 窗口 + 3 分钟诊断余量 |
+| 4 | **压测 userId 复用历史段 = 大规模触发 DB 兜底**：预热会清空 Redis 已购标记，历史订单只活在数据库里；复用 userId 段的请求全部撞 `uk_user_stock`、走 RESTORE_STOCK_ONLY（设计行为，但这不是有效负载） | 压测号段永远用全新区间；`一人一单` 的数据库兜底被真实流量验证了一次（4800 笔全部正确回滚，无超卖） |
+| 5 | **Agent 的「证据不足」是正确行为**：Case 3 里模型看到了 `DO SLEEP(0.12)` 事务（唯一的直接证据），但因为只是瞬时快照、无法与「线程数不足」区分，给了 0.25 并列出还缺的证据。要它定论，缺的是取证能力（单条耗时分布、线程池活跃数），不是更强的 prompt | 评估「模型不给结论」时先问：数据源里存在决定性证据吗？ |
+
+### 批次 5：运行时观测上线（2026-10-10）
+
+**补的就是上表第 5 条缺的三类证据**。实现要点（改动前读 `RuntimeTool` 类注释）：
+
+- **数据源是「进程内 + Prometheus」双份**：进程内 Gauge/Timer 实时且永远可达
+  （Prometheus 挂了它还在——那恰是最需要证据的时刻）；Prometheus 提供窗口视图
+  （rate / histogram_quantile / over_time）。两个口径的范围写在返回体 `caliber` 字段里。
+- **降级标志位是时间窗语义**（最近 5 分钟内发生过降级事件 = 1），不是「此刻 Redis 是否可用」
+  ——系统里没有「Redis 已恢复」事件可监听，探测恢复要侵入请求路径，违背旁路纪律。
+  工具的 note 会把这一点说破，别把它当缺陷「修掉」。
+- **直方图发布写在 Timer 构建器上**（`publishPercentileHistogram()`），不走
+  `management.metrics.*` 配置 —— 那个前缀整段被静默忽略的事故发生过一次。
+- **Micrometer 1.16 的 API 事实（又一个「靠记忆必错」）**：快照分位数的类型是
+  `HistogramSnapshot#percentileValues()` → `ValueAtPercentile[]`（不是记忆里的
+  `PercentileValue`），`value(TimeUnit)` 取数。javap 核实过，版本能力靠字节码不靠记忆。
+
+**上线核对（应用下次重启后执行一次，对齐「去出口上数一次」纪律）**：
+
+```powershell
+# 新序列必须出现在 /actuator/prometheus（应用重启 + 下过一单之后）：
+curl.exe -s "http://localhost:9091/actuator/prometheus" | Select-String "seckill_consume_process_seconds_bucket"
+curl.exe -s "http://localhost:9091/actuator/prometheus" | Select-String "seckill_consume_active_threads"
+curl.exe -s "http://localhost:9091/actuator/prometheus" | Select-String "seckill_degradation_active"
+```
+
+> 序列名在 Java 常量（`SeckillMetrics.METRIC_*`）与 RuntimeTool 的 PromQL 两侧各自存在，
+> 映射关系由 `RuntimeToolTest#prometheusSeriesNamesMatchMicrometerConvention` 锁住；
+> 但「配置/发布真的生效」只有出口核对能证明，别省这一步。
+
 ---
 
 ## 4. 验证清单（改完任何东西都跑这几条）
@@ -403,7 +458,7 @@ mvn -o -B test
 # 5) 应用端到端
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-app.ps1
 #    启动日志里必有这四行「出口核对」（批次 2 的自检）：
-#      [ToolRegistry] 工具白名单就绪：5 个，单次调用超时=3000ms
+#      [ToolRegistry] 工具白名单就绪：6 个，单次调用超时=3000ms
 #      [MetricsTool] 指标目录自检通过：42 条口径引用的 42 个序列名在 Prometheus 中都存在
 #      [LogsTool]    日志底座可用：容量 10000 条，启动完成时已缓存 N 条
 #      [ToolRegistry] 结果整形器就绪：单次结果上限=8000 字符（含 <untrusted_data> 包裹）
@@ -464,19 +519,21 @@ docker info --format "server={{.ServerVersion}}"        # 期望 29.8.1；空则
 
 ## 5. 阅读顺序（新会话按这个顺序读，不要通读全仓库）
 
-1. 本文件（当前状态 + 环境约束，**§3 末尾的「批次 3 新增的 8 条」是本次新增的**）
-2. **`docs/批次3_Agent编排与验收.md`**（**要动 Agent 层就读这一份**：整条链路怎么接、
+1. 本文件（当前状态 + 环境约束，**§3 末尾的「批次 4 新增的教训」是本次新增的**）
+2. **`docs/故障注入实验记录.md`**（**做故障注入、改告警阈值或扩工具前必读**：5 个 Case 的实测、
+   手册三处修正、token 成本基线、工具能力缺口清单）
+3. **`docs/批次3_Agent编排与验收.md`**（**要动 Agent 层就读这一份**：整条链路怎么接、
    8 个缺陷的完整复盘（含 2 个真实运行时才暴露的）、三次真实诊断的证据、给批次 4 的 7 条交接要点）
-3. **`docs/批次2_Tool层与验收.md`**（**要动 Tool 层就读这一份**：5 个工具的契约、
+4. **`docs/批次2_Tool层与验收.md`**（**要动 Tool 层就读这一份**：5 个工具的契约、
    「结构性只读」落在哪一行、5 个缺陷的完整复盘）
-4. `docs/批次1_健康基线快照.md`（故障注入前的基线 + 两个「静默失效」的完整复盘）
-5. `docs/AI监控Agent_可行性评估与准备报告.md` §3（SPEC 与现有工程的 6 处冲突及裁定）
+5. `docs/批次1_健康基线快照.md`（故障注入前的基线 + 两个「静默失效」的完整复盘）
+6. `docs/AI监控Agent_可行性评估与准备报告.md` §3（SPEC 与现有工程的 6 处冲突及裁定）
    + §6（批次 1/2/3 的完成情况与判据）
-6. `docs/AI监控Agent_部署与验收手册.md` §0 / §6 / §9（部署、故障注入命令与排错）
-7. `金融交易系统_AI监控Agent_升级改造_SPEC.md`（需求原文，1521 行，按需查阅）
-8. `docs/秒杀链路文档.md`（**改动业务链路前必读**：失败补偿矩阵、崩溃点、对账判据）
+7. `docs/AI监控Agent_部署与验收手册.md` §0 / §6 / §9（部署、故障注入命令与排错。
+   ⚠️ §6 的注入命令有三处已知问题，以 `docs/故障注入实验记录.md` §0 的修正为准）
+8. `金融交易系统_AI监控Agent_升级改造_SPEC.md`（需求原文，1521 行，按需查阅）
 
-**改业务链路的红线**：`README.md` §9、`docs/秒杀链路文档.md` 与源码注释里
+**改业务链路的红线**：`README.md` §9 与源码注释里
 记录了若干「顺序不可颠倒」的约束（如「先让订单不成立，再归还库存」）。
 AI 监控是**旁路**，不得改动 `Redis → MySQL → Outbox → MQ → Consumer` 主链路。
 

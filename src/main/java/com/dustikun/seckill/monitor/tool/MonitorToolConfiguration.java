@@ -16,6 +16,7 @@ import com.dustikun.seckill.monitor.tool.metrics.MetricCatalog;
 import com.dustikun.seckill.monitor.tool.metrics.MetricsTool;
 import com.dustikun.seckill.monitor.tool.metrics.PrometheusQuerier;
 import com.dustikun.seckill.monitor.tool.mq.MqTool;
+import com.dustikun.seckill.monitor.tool.runtime.RuntimeTool;
 import tools.jackson.databind.ObjectMapper;
 import com.dustikun.seckill.monitor.log.LogSink;
 import org.slf4j.Logger;
@@ -167,6 +168,20 @@ public class MonitorToolConfiguration {
                                      PrometheusQuerier querier, MetricCatalog catalog) {
         return new BusinessTool(reconcileService, outboxService, compensateTaskService, metrics,
                 querier, catalog);
+    }
+
+    /**
+     * 运行时观测 Tool（批次 5）：消费线程池活跃数 / 单条消息处理耗时分布 / 降级标志位。
+     * <p>这是 Case 3 / Case 5 实测暴露的能力缺口（{@code docs/故障注入实验记录.md} §3.5）：
+     * 前五个工具全部查不到「应用此刻的运行状态」，而那正是区分
+     * 「线程数不足」与「单条变慢」（Case 3）、以及「降级确实被触发」（Case 5）
+     * 所缺的证据。它读进程内 Gauge / Timer + Prometheus 窗口视图，
+     * 全部只读、不写任何指标或表 —— 不会自激。
+     */
+    @Bean
+    public RuntimeTool runtimeTool(SeckillMetrics metrics, PrometheusQuerier querier,
+                                   RocketMqProperties mqProperties) {
+        return new RuntimeTool(metrics, querier, mqProperties);
     }
 
     // ================================================================ 注册表

@@ -154,7 +154,7 @@ public final class AgentExecutor {
             notify.onStatus(DiagnosisStatus.FAILED);
             metrics.diagnosis(DiagnosisStatus.FAILED.name());
             log.warn("[AgentExecutor] task={} 进入降级态：{}", taskId, reason);
-            return failure(DiagnosisStatus.FAILED, reason, 0, 0, startNanos, steps, alert, null, null);
+            return failure(DiagnosisStatus.FAILED, reason, 0, 0, null, null, startNanos, steps, alert, null, null);
         }
 
         notify.onStatus(DiagnosisStatus.RUNNING);
@@ -165,6 +165,11 @@ public final class AgentExecutor {
 
         int toolCalls = 0;
         int llmCalls = 0;
+        // token 用量：跨全部 LLM 轮次累加（批次 3 的观测缺口：没有它就答不上
+        // 「这次诊断花了多少钱」）。【口径】服务端不返回 usage 时保持 null 并在
+        // 写 raw_result 时省略键 —— 本项目的约定是「取不到返回 null」，绝不写 0 冒充。
+        Integer promptTokens = null;
+        Integer completionTokens = null;
         boolean collectingNotified = false;
         boolean finalAnswerForced = false;
         String lastFinishReason = null;
@@ -177,8 +182,8 @@ public final class AgentExecutor {
                 steps.add(reason);
                 notify.onStatus(DiagnosisStatus.FAILED);
                 metrics.diagnosis(DiagnosisStatus.FAILED.name());
-                return failure(DiagnosisStatus.FAILED, reason, toolCalls, llmCalls, startNanos,
-                        steps, alert, lastFinishReason, null);
+                return failure(DiagnosisStatus.FAILED, reason, toolCalls, llmCalls,
+                        promptTokens, completionTokens, startNanos, steps, alert, lastFinishReason, null);
             }
 
             LlmRequest request = new LlmRequest(llmProperties.model(), List.copyOf(messages),
@@ -196,11 +201,18 @@ public final class AgentExecutor {
                 notify.onStatus(DiagnosisStatus.FAILED);
                 metrics.diagnosis(DiagnosisStatus.FAILED.name());
                 log.warn("[AgentExecutor] task={} {}", taskId, reason);
-                return failure(DiagnosisStatus.FAILED, reason, toolCalls, llmCalls, startNanos,
-                        steps, alert, lastFinishReason, null);
+                return failure(DiagnosisStatus.FAILED, reason, toolCalls, llmCalls,
+                        promptTokens, completionTokens, startNanos, steps, alert, lastFinishReason, null);
             }
             lastFinishReason = response.finishReason();
             steps.add("LLM 第 " + llmCalls + " 轮：" + response.describe());
+            if (response.promptTokens() != null) {
+                promptTokens = (promptTokens == null ? 0 : promptTokens) + response.promptTokens();
+            }
+            if (response.completionTokens() != null) {
+                completionTokens = (completionTokens == null ? 0 : completionTokens)
+                        + response.completionTokens();
+            }
 
             // ---------- 没有工具调用 = 最终答复 ----------
             if (!response.hasToolCalls()) {
@@ -215,10 +227,10 @@ public final class AgentExecutor {
                     notify.onStatus(DiagnosisStatus.INSUFFICIENT_EVIDENCE);
                     metrics.diagnosis(DiagnosisStatus.INSUFFICIENT_EVIDENCE.name());
                     return failure(DiagnosisStatus.INSUFFICIENT_EVIDENCE, reason, toolCalls, llmCalls,
-                            startNanos, steps, alert, lastFinishReason, response.content());
+                            promptTokens, completionTokens, startNanos, steps, alert, lastFinishReason, response.content());
                 }
-                return conclude(notify, response, toolCalls, llmCalls, startNanos, steps,
-                        defaults, alert, lastFinishReason);
+                return conclude(notify, response, toolCalls, llmCalls, promptTokens, completionTokens,
+                        startNanos, steps, defaults, alert, lastFinishReason);
             }
 
             // ---------- 有工具调用 ----------
@@ -229,8 +241,8 @@ public final class AgentExecutor {
                 steps.add(reason);
                 notify.onStatus(DiagnosisStatus.FAILED);
                 metrics.diagnosis(DiagnosisStatus.FAILED.name());
-                return failure(DiagnosisStatus.FAILED, reason, toolCalls, llmCalls, startNanos,
-                        steps, alert, lastFinishReason, response.content());
+                return failure(DiagnosisStatus.FAILED, reason, toolCalls, llmCalls,
+                        promptTokens, completionTokens, startNanos, steps, alert, lastFinishReason, response.content());
             }
 
             // 原样回灌 tool_calls：丢掉 id 或换顺序会让模型认为「我请求的调用没有结果」，
@@ -277,7 +289,8 @@ public final class AgentExecutor {
      * </ul>
      */
     private AgentRunResult conclude(StatusListener notify, LlmResponse response, int toolCalls,
-                                    int llmCalls, long startNanos, List<String> steps,
+                                    int llmCalls, Integer promptTokens, Integer completionTokens,
+                                    long startNanos, List<String> steps,
                                     DiagnosisDefaults defaults, AlertEvent alert,
                                     String finishReason) {
         notify.onStatus(DiagnosisStatus.ANALYZING);
@@ -295,7 +308,7 @@ public final class AgentExecutor {
                     status, toolCalls, llmCalls, elapsedMillis(startNanos), diagnosis.rootCause());
 
             Map<String, Object> raw = commonRaw(llmProperties.model(), finishReason, llmCalls,
-                    toolCalls, content, alert);
+                    toolCalls, content, alert, promptTokens, completionTokens);
             return new AgentRunResult(status, diagnosis, toolCalls, llmCalls,
                     elapsedMillis(startNanos), null, content, raw, steps);
         } catch (DiagnosisParseException e) {
@@ -307,7 +320,7 @@ public final class AgentExecutor {
             steps.add(reason);
             log.warn("[AgentExecutor] 诊断输出不合规：{}", reason);
             return failure(DiagnosisStatus.INSUFFICIENT_EVIDENCE, reason, toolCalls, llmCalls,
-                    startNanos, steps, alert, finishReason, content);
+                    promptTokens, completionTokens, startNanos, steps, alert, finishReason, content);
         }
     }
 
@@ -371,10 +384,11 @@ public final class AgentExecutor {
     // ================================================================ 结果构造
 
     private AgentRunResult failure(DiagnosisStatus status, String reason, int toolCalls, int llmCalls,
+                                   Integer promptTokens, Integer completionTokens,
                                    long startNanos, List<String> steps, AlertEvent alert,
                                    String finishReason, String rawContent) {
         Map<String, Object> raw = commonRaw(llmProperties.model(), finishReason, llmCalls, toolCalls,
-                rawContent, alert);
+                rawContent, alert, promptTokens, completionTokens);
         raw.put("failure", reason);
         return new AgentRunResult(status, null, toolCalls, llmCalls,
                 elapsedMillis(startNanos), reason, rawContent, raw, steps);
@@ -387,11 +401,20 @@ public final class AgentExecutor {
      * （被截断了？模型记错了？还是压根没问成？）。
      */
     private static Map<String, Object> commonRaw(String model, String finishReason, int llmCalls,
-                                                 int toolCalls, String rawContent, AlertEvent alert) {
+                                                 int toolCalls, String rawContent, AlertEvent alert,
+                                                 Integer promptTokens, Integer completionTokens) {
         Map<String, Object> raw = new LinkedHashMap<>(AgentRunResult.rawResultOf(
                 model, finishReason, llmCalls, toolCalls, rawContent));
         raw.put("service", alert.serviceName());
         raw.put("alertType", alert.alertType());
+        // 【省略键而不是写 0】usage 缺失（服务端没返回 / 还没调过 LLM）与「恰好 0 个 token」
+        // 是两回事；写 0 会让「按 token 统计成本」的人把缺失当成免费。
+        if (promptTokens != null) {
+            raw.put("promptTokens", promptTokens);
+        }
+        if (completionTokens != null) {
+            raw.put("completionTokens", completionTokens);
+        }
         return raw;
     }
 

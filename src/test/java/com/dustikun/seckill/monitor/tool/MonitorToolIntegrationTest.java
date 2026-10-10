@@ -91,15 +91,19 @@ class MonitorToolIntegrationTest {
     private SeckillMetrics seckillMetrics;
 
     @Test
-    @DisplayName("白名单恰好是 SPEC 第 9 节要求的五类（Metrics / Logs / DB / MQ / Business）")
+    @DisplayName("白名单覆盖 SPEC 第 9 节要求的五类 + 批次 5 的运行时观测（query_runtime）")
     void whitelistCoversTheFiveSpecTools() {
-        assertEquals(5, registry.size(), "实际白名单：" + registry.names());
-        assertEquals(List.of("query_metric", "search_logs", "query_db", "query_mq", "query_business"),
-                registry.names());
+        // 批次 5 新增 query_runtime（Case 3/5 实测暴露的运行时观测能力缺口）。
+        // 五类 SPEC 工具仍然必须一个不少 —— 这里用 containsAll 而不是整表相等，
+        // 把「SPEC 五类是否齐全」与「白名单总长」两件事分开断言。
+        assertEquals(List.of("query_metric", "search_logs", "query_db", "query_mq",
+                        "query_business", "query_runtime"),
+                registry.names(), "实际白名单：" + registry.names());
+        assertEquals(6, registry.size(), "实际白名单：" + registry.names());
 
         // 每个工具都要能被 OpenAI 形态的 tools 数组表达
         List<Map<String, Object>> definitions = registry.definitions();
-        assertEquals(5, definitions.size());
+        assertEquals(6, definitions.size());
         for (Map<String, Object> definition : definitions) {
             assertEquals("function", definition.get("type"));
             @SuppressWarnings("unchecked")
