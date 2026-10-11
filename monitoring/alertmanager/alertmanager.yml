@@ -58,7 +58,9 @@ receivers:
   # ---------------------------------------------------------------------------
   # AI Monitor API（SPEC 第 15 节的触发链路终点）
   #
-  # `http://host.docker.internal:8081/api/ai/alerts` 是本项目后端将提供的端点：
+  # `http://backend:8081/api/ai/alerts` 是后端的接收端点（SPEC 第 15 节）。
+  # 后端已容器化，与 Alertmanager 同在 compose 网络，直接用服务名访问；
+  # 若回退到宿主机进程形态，需改回 http://host.docker.internal:8081/api/ai/alerts。
   # 接收 Alertmanager 的 webhook 格式，转换为内部 AlertEvent，
   # 经 Incident 聚合后创建诊断任务。
   #
@@ -74,7 +76,7 @@ receivers:
   # ---------------------------------------------------------------------------
   - name: ai-monitor-webhook
     webhook_configs:
-      - url: "http://host.docker.internal:8081/api/ai/alerts"
+      - url: "http://backend:8081/api/ai/alerts"
         send_resolved: true
         # 单次投递超时。设 5s 而不是默认 10s：
         # 这是一个「接收并立即返回 202」的端点，它不该慢；

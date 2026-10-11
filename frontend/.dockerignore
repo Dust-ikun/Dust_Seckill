@@ -1,0 +1,6 @@
+# 前端镜像构建上下文裁剪：编译只需要源码与 package*.json
+node_modules
+dist
+.git
+Dockerfile
+.dockerignore

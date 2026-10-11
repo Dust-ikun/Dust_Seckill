@@ -32,26 +32,23 @@ scrape_configs:
   # ---------------------------------------------------------------------------
   # 业务应用（Spring Boot + Micrometer）
   #
-  # 【为什么目标是 9091 而不是 8081】本项目刻意把 actuator 拆到独立管理端口，
-  # 且只绑 127.0.0.1（见 application.yaml 的注释）：
-  # 「业务端口对外提供秒杀能力」与「运维端点仅本机可达」两个目标同时成立，
-  # 不需要引入 Spring Security。
+  # 【为什么目标是 9091 而不是 8081】本项目刻意把 actuator 拆到独立管理端口。
   #
-  # Prometheus 在容器里，所以要经 host.docker.internal 访问宿主机的 127.0.0.1。
-  # 这意味着宿主机上必须允许来自 Docker 网桥的连接 —— 由于 actuator 只绑回环，
-  # 容器是连不上的。因此应用侧需要一个额外的开关：
-  # 用 `--spring.profiles.active=docker` 启动时，management.server.address 会被
-  # 放开为 0.0.0.0（见 application-docker.yaml）。
-  # 这是本方案里唯一一处「为了让容器能抓到指标而放宽监听地址」的取舍，
-  # 换来的是不必给 Prometheus 装 host 网络模式。
+  # 【当前形态：应用也容器化了】后端跑在 backend 服务里（compose 同一网络），
+  # Prometheus 直接走服务名 backend:9091 抓取，不再依赖 host.docker.internal
+  # 与宿主机端口发布 —— 这让整套栈在 Linux 服务器上的行为与本地完全一致。
+  # 容器内 management.server.address=0.0.0.0（application-docker.yaml）恰好满足本需求。
+  #
+  # 【回退到宿主机进程形态时】把目标改回 host.docker.internal:9091
+  # （Docker Desktop 内置该域名；Linux 需在 compose 里保留 extra_hosts 声明）。
   # ---------------------------------------------------------------------------
   - job_name: order-service
     metrics_path: /actuator/prometheus
     static_configs:
-      - targets: ["host.docker.internal:9091"]
+      - targets: ["backend:9091"]
         labels:
           service: order-service
-          instance_type: host-process
+          instance_type: container
 
   # ---------------------------------------------------------------------------
   # Prometheus 自身
@@ -95,11 +92,10 @@ scrape_configs:
   # 因此改用 Broker **内置**的 Prometheus 导出器（metricsExporterType=PROM），
   # 零新增依赖、零新增容器，而且给出的就是精确的消费堆积。
   #
-  # 【它与 order-service 那个 job 的目标写法**故意不同**，这不是笔误】
-  #     order-service  跑在宿主机  → Prometheus 必须经 host.docker.internal 访问
-  #     rocketmq-broker 跑在容器里 → Prometheus 直接走 compose 网络访问服务名
-  # 两者互换的后果都是「目标长期 DOWN」：前者会连到容器自己的 127.0.0.1，
-  # 后者会绕到宿主机的 5557（那里只是端口转发，且只绑了回环）。
+  # 【它与 order-service 那个 job 的目标写法形同实异，这不是笔误】
+  #     order-service   → 服务名 backend（同一 compose 网络的容器，actuator 端口 9091）
+  #     rocketmq-broker → 服务名 rocketmq-broker（同一 compose 网络的容器）
+  # 两者现在都是容器间直连，不再有任何 host.docker.internal 的参与。
   #
   # 【指标名的实际形态】OTel 的 Prometheus 导出器不加 instrumentation scope 前缀，
   # 因此暴露出来的就是 RocketMQ 的原始名字。验证方式：

@@ -1,11 +1,19 @@
 # =============================================================================
-#  秒杀系统 + AI 监控 Agent —— 中间件统一编排
+#  秒杀系统 + AI 监控 Agent —— 全栈一键编排（中间件 + 后端 + 前端 + 可观测性）
 #
-#  【设计边界】本文件只编排「中间件与可观测性基础设施」，不包含业务应用本身。
-#  原因：业务应用需要在 IDE 里断点调试、需要频繁改配置重启，塞进容器后每次改一行
-#  代码都要重新 build 镜像，反而拖慢迭代。应用以 host 进程运行，通过 localhost 访问
-#  下面这些容器暴露的端口 —— 对 Spring Boot 来说，「连 127.0.0.1:3307」与
-#  「连一台远程 MySQL」在配置上没有任何区别。
+#  【设计边界（已变更）】本文件现在编排**整条链路**：中间件、业务后端（backend）、
+#  前端（frontend，profile web）与可观测性（profile observability）。
+#  后端不再以宿主机进程运行，目的是让任何装了 Docker 的人 clone 后两条命令跑起来：
+#      copy .env.example .env   （Windows：Copy-Item；填一次 MYSQL_ROOT_PASSWORD）
+#      docker compose up -d --build
+#  中间件地址从服务名解析（mysql / redis / rocketmq-namesrv / prometheus），
+#  应用侧通过 Spring 环境变量覆盖（SPRING_DATASOURCE_URL 等）接入 —— 见 backend 服务。
+#
+#  【仍想在宿主机跑应用做断点调试】（scripts/run-app.ps1 那条路）需要同步回退三处：
+#      ① docker/rocketmq/broker.conf 的 brokerIP1 改回 127.0.0.1
+#      ② monitoring/prometheus/prometheus.yml 的 order-service 目标改回
+#         host.docker.internal:9091
+#      ③ .env 里 BACKEND_ORIGIN 改回 http://host.docker.internal:8081
 #
 #  【端口分配的两条原则】
 #   1) MySQL 刻意映射到 3307 而不是 3306：本机已存在原生 MySQL84 服务占用 3306。
@@ -285,6 +293,69 @@ services:
     networks: [seckill-net]
 
   # ===========================================================================
+  #  业务后端（Spring Boot 容器化，取代原来的宿主机 java -jar 进程）
+  #
+  #  【配置如何生效】镜像内跑的是 application-docker.yaml（SPRING_PROFILES_ACTIVE=docker），
+  #  它原本假设「中间件端口已发布到宿主机」。现在应用自己也在容器网络里，
+  #  因此下面用 Spring Boot 的环境变量覆盖机制（ relaxed binding：SPRING_DATASOURCE_URL
+  #  覆盖 spring.datasource.url）把 localhost 全部替换成 compose 服务名。
+  #  application-docker.yaml / application.yaml 一行都不用改 —— 同一份配置
+  #  既支持宿主机形态也支持容器形态，差别只在注入的环境变量。
+  #
+  #  【端口为什么只绑 127.0.0.1】8081/9091 发布到宿主机只是给人调试和压测脚本用的，
+  #  容器之间的访问（Nginx 反代、Prometheus 抓取、Alertmanager webhook）
+  #  全部走 compose 网络的服务名，不经过端口发布。绑回环避免把管理端口暴露给局域网。
+  # ===========================================================================
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: seckill-backend:latest
+    container_name: seckill-backend
+    restart: unless-stopped
+    # 三个依赖都必须 healthcheck 通过：应用启动时会立刻建 Hikari 连接池、
+    # 连 Redis、注册 RocketMQ 客户端，任何一个没就绪都会让容器陷入重启循环
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rocketmq-broker:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      # 容器网络内的 MySQL 永远是 mysql:3306 —— 与宿主机映射端口（MYSQL_HOST_PORT）
+      # 无关。这样「换宿主机端口避免冲突」不再影响应用侧配置。
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/${MYSQL_DATABASE:-seckill}?useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD is not set - copy .env.example to .env and fill it in}
+      SPRING_DATA_REDIS_HOST: redis
+      # 显式钉死 6379：.env 里的 REDIS_HOST_PORT 只是宿主机映射端口，
+      # 容器网络内部端口永远是 6379，不随它变（否则改宿主机端口会连带弄断容器内连接）
+      SPRING_DATA_REDIS_PORT: 6379
+      SECKILL_MQ_NAME_SERVER: rocketmq-namesrv:9876
+      # AI Monitor 的 Metrics/MQ Tool 查 Prometheus：同样走服务名直连，不经过宿主机映射
+      SECKILL_MONITOR_TOOL_PROMETHEUS_BASE_URL: http://prometheus:9090
+      # LLM Key 不落盘、只透传；留空时 Agent 自动进入「未配置 LLM」降级态
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      JAVA_OPTS: "-XX:MaxRAMPercentage=70.0"
+      TZ: Asia/Shanghai
+    ports:
+      - "127.0.0.1:${BACKEND_HOST_PORT:-8081}:8081"
+      - "127.0.0.1:${BACKEND_MANAGEMENT_HOST_PORT:-9091}:9091"
+    healthcheck:
+      # /actuator/health 在 DB/Redis 不可达时返回 503，curl -f 会失败 ——
+      # 因此这个判据同时覆盖了「进程死了」和「进程活着但依赖不通」两种情况
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9091/actuator/health >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      # Spring Boot 启动 + 首次建连通常 20~40s；期间 health 返回 503 而不是拒绝连接
+      start_period: 60s
+    logging: *default-logging
+    networks: [seckill-net]
+
+  # ===========================================================================
   #  可观测性与 AI 监控基础设施
   #
   #  用 profile 分组（observability）：
@@ -408,6 +479,32 @@ services:
     depends_on:
       prometheus:
         condition: service_started
+    logging: *default-logging
+    networks: [seckill-net]
+
+  # ---------------------------------------------------------------------------
+  # 前端控制台（Vite + React 构建产物，Nginx 托管并反代后端）
+  #
+  # 【后端从哪里来】后端现在也是容器（backend 服务），反代目标直接写 compose
+  # 服务名 http://backend:8081 —— 与 host.docker.internal 方案相比，
+  # 这不依赖 Docker Desktop 的特殊域名，在 Linux 服务器上同样可用。
+  # 仍保留在 profile（web）里：由 .env 的 COMPOSE_PROFILES 控制是否默认启动。
+  # ---------------------------------------------------------------------------
+  frontend:
+    build: ./frontend
+    container_name: seckill-frontend
+    restart: unless-stopped
+    profiles: [web]
+    environment:
+      BACKEND_ORIGIN: ${BACKEND_ORIGIN:-http://backend:8081}
+    ports:
+      - "${FRONTEND_HOST_PORT:-8080}:80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
     logging: *default-logging
     networks: [seckill-net]
 

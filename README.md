@@ -2,6 +2,7 @@
 
 一个按阶段演进的高并发秒杀系统，当前状态为**阶段 5-A：Redis 预扣 + 预订单状态机 + 本地消息表（Outbox）+ RocketMQ 异步落库**，
 并在此之上叠加了一套**旁路**的 AI 监控 Agent（告警 → ReAct 取证 → 结构化诊断，见 §2.2 与 §5.2）。
+整套系统（中间件 + 后端 + 前端控制台 + 可观测性栈）已**全量容器化**，`docker compose up -d --build` 一键拉起（见 §7）。
 
 核心设计原则：**宁可少卖，绝不超卖**——所有失败路径的处置顺序、补偿与回补策略均按此裁决。
 
@@ -20,6 +21,7 @@
 | Micrometer + Prometheus | Boot 4 自带 | 指标唯一出口（`/actuator/prometheus`，管理端口 9091） |
 | Prometheus / Alertmanager / Grafana | v3.1.0 / v0.28 / v11.4 | 采集 + 告警路由 + 看板（`docker compose --profile observability`，见 §7） |
 | RocketMQ Broker 内置 OTel 导出器 | — | 精确消费堆积（RocketMQ 5.x **没有** JMX MBean，见 `docker/rocketmq/broker.conf` 末尾的实测证据） |
+| React 19 + Vite + Antd 6 + TanStack Query | 前端控制台 | 秒杀演示 / 运维对账 / AI 事故中心（`frontend/`，Nginx 容器托管并反代后端，详见 `frontend/README.md`） |
 | DeepSeek（OpenAI 兼容端点） | `deepseek-chat` | AI 监控 Agent 的推理。**手写客户端**、零新增依赖（Spring AI 1.1.8 依赖 Boot 3.5，与本项目的 Boot 4 不兼容） |
 | Lombok | — | 样板代码 |
 
@@ -122,8 +124,18 @@ monitoring/              # 可观测性栈配置（Prometheus 规则 / Alertmana
 ├── validate_config.py   # 配置静态校验器（10 组 67 项；改配置后必跑）
 └── prometheus/alertmanager/grafana/...
 
+frontend/                # 前端控制台（Vite + React 19 + Antd 6，详见 frontend/README.md）
+├── src/features/        # 按业务域分包：seckill / ops / monitor（+ auth 预留壳子）
+├── Dockerfile           # Vite 构建 → Nginx 托管 + 反代后端（nginx.conf.template）
+└── src/lib/api/         # 请求单点收口（Result 解包、鉴权头、错误翻译）
+
+Dockerfile               # 后端多阶段构建镜像（Maven 构建 → JRE 运行，层缓存只针对 pom.xml）
+.dockerignore            # 裁剪后端构建上下文（frontend/node_modules 等不进 daemon）
+
 docker/                  # RocketMQ 配置（broker.conf / namesrv.conf）+ 其它镜像所需文件
-scripts/                 # run-app.ps1（导出 .env 后启动，纯 ASCII）/ remove-native-middleware.ps1
+scripts/                 # up.ps1 / up.sh（一键拉起全栈，缺 .env 自动复制）
+│                        # run-app.ps1（宿主机进程形态，导出 .env 后启动，纯 ASCII）
+│                        # remove-native-middleware.ps1
 ```
 
 ## 4. 数据库表
@@ -183,8 +195,14 @@ AI 三张表另跑一次：`mysql -uroot -p seckill < src/main/resources/db/sche
 | GET | `/api/ai/incidents?limit=` | 当前告警（`end_time IS NULL`）。**用 `end_time` 而非 `status` 筛**：诊断结束 ≠ 故障恢复 |
 | GET | `/api/ai/tools` | 工具白名单与 `definitions`（模型看到的 `tools` 就是这一份） |
 
-前端控制台：`http://localhost:8081/ai-monitor.html`（批次 4 新增，单文件无依赖：
-当前告警 / 历史诊断 / 结论+token 用量 / 一行工具链路 / 手工触发）。
+前端控制台（两个入口，推荐前者）：
+
+- **React 控制台**：`http://localhost:8080`（`frontend/`，Nginx 托管并反代后端）——
+  `/seckill` 秒杀演示（下单 + 订单状态机轮询 QUEUED → SUCCESS/FAILED）、
+  `/ops` 运行指标分段总账与库存对账（含 repair 模式）、
+  `/monitor` + `/monitor/:incidentId` AI 事故中心与诊断详情（结论 / 证据 / 建议 + ReAct 工具调用轨迹时间线）。
+- **静态单文件控制台**（批次 4，仍保留）：`http://localhost:8081/ai-monitor.html` ——
+  当前告警 / 历史诊断 / 结论+token 用量 / 一行工具链路 / 手工触发。
 
 ## 6. 关键配置（`application.yaml` → `seckill.*`）
 
@@ -200,52 +218,75 @@ AI 三张表另跑一次：`mysql -uroot -p seckill < src/main/resources/db/sche
 
 ## 7. 快速启动
 
-### 前置组件
-
-**推荐：全部走 Docker**（`docker-compose.yml` 里已配好 4 个核心服务 + 可观测性栈，端口与下表一致）。
-也可以自备本地中间件 —— 端口就是标准值，不需要改任何配置。
-
-| 组件 | 端口 |
-|---|---|
-| MySQL 8.x | 3306 |
-| Redis | 6379 |
-| RocketMQ NameServer | 9876 |
-| RocketMQ Broker | 10911 / 10909 |
-| Prometheus / Alertmanager / Grafana | 9090 / 9093 / 3000 |
-| RocketMQ Broker 指标（仅回环） | 5557 |
-
-### 步骤
+### 一键全栈（推荐：全部容器化）
 
 ```powershell
-# 0. 启动中间件（复用数据卷；首次为空卷时会自动执行 db/schema*.sql）
-docker compose up -d mysql redis rocketmq-namesrv rocketmq-broker
-#    可选：可观测性栈（Prometheus + Alertmanager + Grafana，共 46 个面板）
-docker compose --profile observability up -d
+# 方式一：一键脚本（缺 .env 时自动从 .env.example 复制）
+.\scripts\up.ps1                # Linux/macOS: ./scripts/up.sh；-NoBuild 跳过镜像构建
 
-# 1. 非 Docker 建库时可手跑（Docker 首启会自动执行）
-#    mysql -uroot -p < src/main/resources/db/schema.sql
-#    mysql -uroot -p < src/main/resources/db/schema-ai-monitor.sql
+# 方式二：手动两步
+copy .env.example .env          # Windows；Linux/macOS 用 cp。填一次 MYSQL_ROOT_PASSWORD
+docker compose up -d --build
+```
 
-# 2. 构建（Maven，JDK 21）
-mvn package -DskipTests
+启动内容与入口（`.env` 的 `COMPOSE_PROFILES` 默认 `web,observability`，即全部启动；
+改为空则只起中间件 + 后端核心链路）：
 
-# 3. 启动（推荐用脚本：它把 .env 导出成进程环境变量，避免「容器在 6380、应用连 6379」）
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-app.ps1 -SkipBuild
-#    或直接跑（此时连接信息取自 application.yaml）
-java -jar target/seckill-0.0.1-SNAPSHOT.jar
+| 入口 | 地址 |
+|---|---|
+| 前端控制台（Nginx 容器，profile: web） | http://localhost:8080 |
+| 后端 API（发布到宿主机仅作调试/压测用） | http://localhost:8081（管理端口 9091，只绑回环） |
+| Grafana | http://localhost:3000（admin/admin） |
+| Prometheus / Alertmanager | http://localhost:9090 / 9093 |
 
-# 4. 预热并下单（业务端口 8081；运维端点在 9091，只绑回环）
+随后预热并下单：
+
+```powershell
 curl -X POST "http://localhost:8081/seckill/preheat?stockId=1"
 curl -X POST "http://localhost:8081/seckill?userId=1001&stockId=1"
 # 拿到 orderNo 后轮询
 curl "http://localhost:8081/seckill/order/status?orderNo=<orderNo>&userId=1001&stockId=1"
 
-# 5. 可选：手工触发一次 AI 诊断（不需要真的制造故障；没配 Key 时会落 FAILED 并写明原因）
+# 可选：手工触发一次 AI 诊断（不需要真的制造故障；没配 Key 时会落 FAILED 并写明原因）
 curl -X POST "http://localhost:8081/api/ai/diagnosis" -H "Content-Type: application/json" `
   -d "{\"service\":\"order-service\",\"alertType\":\"LATENCY_HIGH\",\"severity\":\"HIGH\",\"value\":2.1,\"threshold\":1.0}"
 ```
 
-应用端口默认 `8081`。常用降级开关：`--seckill.mq.enabled=false`（无 Broker 调试）、`--seckill.outbox.enabled=false`（回到同步投递对比）。
+关键实现说明（详见 `docker-compose.yml` 文件头与各服务注释）：
+
+- 后端容器跑 `application-docker.yaml`（`SPRING_PROFILES_ACTIVE=docker`），中间件地址用
+  Spring 环境变量覆盖机制（`SPRING_DATASOURCE_URL` 等 relaxed binding）改指 compose 服务名，
+  **yaml 一行不用改** —— 同一份配置同时支持宿主机形态与容器形态。
+- `brokerIP1 = rocketmq-broker`（服务名）：Broker 注册给 NameServer 的地址在容器网络里
+  必须是客户端真正可达的地址；容器内 127.0.0.1 指向客户端自己，会「投消息即超时」。
+- Prometheus 抓取 / Alertmanager webhook 走服务名 `backend:9091` / `backend:8081`，
+  不再依赖 host.docker.internal —— 整套栈在 Linux 服务器上行为与本地一致。
+
+### 数据库初始化
+
+Docker 首启会自动执行 `db/schema*.sql`（空卷时）；非 Docker 建库时手跑：
+
+```powershell
+mysql -uroot -p seckill < src/main/resources/db/schema.sql
+mysql -uroot -p seckill < src/main/resources/db/schema-ai-monitor.sql
+```
+
+端口分配（自备本地中间件时按标准端口即可）：MySQL 宿主机映射 3307（避开本机原生 3306）/
+Redis 6379 / NameServer 9876 / Broker 10911、10909 / Broker 指标 5557（仅回环）。
+
+### 回退：后端以宿主机进程运行（IDE 断点调试形态）
+
+```powershell
+mvn package -DskipTests
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-app.ps1 -SkipBuild
+# 或直接：java -jar target/seckill-0.0.1-SNAPSHOT.jar
+```
+
+该形态需同步回退三处（均为容器化时改过的）：`docker/rocketmq/broker.conf` 的 brokerIP1
+改回 `127.0.0.1`、`monitoring/prometheus/prometheus.yml` 的 order-service 目标改回
+`host.docker.internal:9091`、`.env` 的 `BACKEND_ORIGIN` 改回 `http://host.docker.internal:8081`。
+
+常用降级开关：`--seckill.mq.enabled=false`（无 Broker 调试）、`--seckill.outbox.enabled=false`（回到同步投递对比）。
 
 ## 8. 测试
 
