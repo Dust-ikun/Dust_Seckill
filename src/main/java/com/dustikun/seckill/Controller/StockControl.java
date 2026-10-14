@@ -4,6 +4,8 @@ import com.dustikun.seckill.Common.Exception.ErrorCode;
 import com.dustikun.seckill.Common.result.Result;
 import com.dustikun.seckill.Mapper.StockMapper;
 import com.dustikun.seckill.entity.Stock;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RestController;
@@ -43,16 +45,19 @@ public class StockControl {
      * 查询数据库侧库存。
      *
      * @param id 活动 ID
-     * @return 统一 {@link Result} 包装；商品不存在时返回 {@link ErrorCode#STOCK_NOT_FOUND}。
+     * @return 统一 {@link Result} 包装；商品不存在时返回 <b>HTTP 404</b> +
+     *         {@link ErrorCode#STOCK_NOT_FOUND} —— 状态码让机器（监控 / 网关）能直接识别失败，
+     *         body 仍带业务码与文案给人看。
      *         <p>响应契约与 {@code SeckillController} 对齐（此前直接返回 entity，
      *         且查不到时返回 HTTP 200 + body {@code null}，调用方拿不到错误码）。
      */
     @GetMapping("/stock/{id}")
-    public Result<?> stock(@PathVariable Long id) {
+    public ResponseEntity<Result<?>> stock(@PathVariable Long id) {
         Stock stock = stockMapper.selectById(id);
         if (stock == null) {
-            return Result.fail(ErrorCode.STOCK_NOT_FOUND);
+            return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                    .body(Result.fail(ErrorCode.STOCK_NOT_FOUND));
         }
-        return Result.success("数据库侧库存", stock);
+        return ResponseEntity.ok(Result.success("数据库侧库存", stock));
     }
 }

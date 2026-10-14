@@ -127,8 +127,13 @@ async function api(path, opts) {
   const res = await fetch(API + path, opts);
   let body = null;
   try { body = await res.json(); } catch (e) { /* 非 JSON（如 500 空体） */ }
+  // 第一层：HTTP 状态码。4xx/5xx 一律视为失败（后端已按语义返回真实状态码）
   if (!res.ok) throw new Error((body && body.message) || (res.status + ' ' + res.statusText));
-  return body.data;
+  // 第二层：body 业务码。兼容「HTTP 200 + code !== "0"」形态的业务失败，避免把失败当成功
+  if (body && typeof body.code === 'string' && body.code !== '0') {
+    throw new Error(body.message || ('业务失败：' + body.code));
+  }
+  return body && body.data;
 }
 function statusTag(status) {
   const map = { RUNNING:'run', COLLECTING_EVIDENCE:'run', ANALYZING:'run',

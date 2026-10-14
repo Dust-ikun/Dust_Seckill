@@ -10,6 +10,8 @@ import com.dustikun.seckill.Mq.SeckillMessageProducer;
 import com.dustikun.seckill.Service.SeckillService;
 import com.dustikun.seckill.Service.StockReconcileService;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.LinkedHashMap;
@@ -142,14 +144,20 @@ public class SeckillController {
 
     /**
      * 查询 Redis 侧剩余库存（真实可售余量，以它为准，而不是数据库）。
+     *
+     * <p>未预热时返回 <b>HTTP 409</b> + {@link ErrorCode#STOCK_NOT_READY}：
+     * 「活动还没准备好」用冲突（409）表达比 200 更准确的一层含义是
+     * 机器（监控 / 压测探活）能直接看出这是失败，而不是一次「成功但值为空」的查询 ——
+     * 后者会让调用方拿 {@code null} 去做决策。body 契约不变。
      */
     @GetMapping("/remain")
-    public Result<?> remain(@RequestParam Long stockId) {
+    public ResponseEntity<Result<?>> remain(@RequestParam Long stockId) {
         Integer remain = seckillService.remain(stockId);
         if (remain == null) {
-            return Result.fail(ErrorCode.STOCK_NOT_READY);
+            return ResponseEntity.status(HttpStatus.CONFLICT)
+                    .body(Result.fail(ErrorCode.STOCK_NOT_READY));
         }
-        return Result.success("Redis 剩余库存", remain);
+        return ResponseEntity.ok(Result.success("Redis 剩余库存", remain));
     }
 
     /**
