@@ -44,7 +44,8 @@ import java.util.concurrent.locks.ReentrantLock;
  * 按原文去重，这 3000 行是 3000 个不同的样本，于是 {@code limit=20} 会被它们占满 ——
  * 而 Agent 真正需要的是「有哪几种不同的错误」，那可能是 2 种。
  * 所以去重键用<b>把变量替换成占位符之后的模板</b>，但返回的样本是<b>原文</b>
- * （见 {@link Signature#representative}），于是既不丢信息，也不被重复淹没。
+ * （签名由 {@link #signature(LogRecord)} 生成，代表样本原文保存在内部类
+ * {@code Acc} 的 {@code representative} 字段），于是既不丢信息，也不被重复淹没。
  *
  * <h2>线程安全</h2>
  * <p>

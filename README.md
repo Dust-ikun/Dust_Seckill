@@ -13,7 +13,7 @@
 | 组件 | 版本 | 用途 |
 |---|---|---|
 | Java | 21 | 运行时 |
-| Spring Boot | 4.0.8 | Web 框架（注意：RocketMQ 官方 starter 最高适配 Boot 3.x，故使用原生 `rocketmq-client` 5.3.2 + 手写配置类管理生命周期） |
+| Spring Boot | 4.0.8 | Web 框架（注意：RocketMQ 官方 starter 基线为 Boot 2.7.18 / Spring 5.3.27 / Java 8——实查最新版 2.3.5（2025-12-03）的父 POM，无 Boot 3/4 适配版，故使用原生 `rocketmq-client` 5.3.2 + 手写配置类管理生命周期） |
 | MySQL | 8.x | 订单 / 库存 / 补偿任务 / Outbox 持久化 |
 | Redis | 6+（Lettuce） | 库存预扣、一人一单去重、Lua 脚本原子扣减 |
 | RocketMQ | 5.3.2（客户端） | 订单落库消息的异步投递 |
@@ -22,7 +22,7 @@
 | Prometheus / Alertmanager / Grafana | v3.1.0 / v0.28 / v11.4 | 采集 + 告警路由 + 看板（`docker compose --profile observability`，见 §7） |
 | RocketMQ Broker 内置 OTel 导出器 | — | 精确消费堆积（RocketMQ 5.x **没有** JMX MBean，见 `docker/rocketmq/broker.conf` 末尾的实测证据） |
 | React 19 + Vite + Antd 6 + TanStack Query | 前端控制台 | 秒杀演示 / 运维对账 / AI 事故中心（`frontend/`，Nginx 容器托管并反代后端，详见 `frontend/README.md`） |
-| DeepSeek（OpenAI 兼容端点） | `deepseek-chat` | AI 监控 Agent 的推理。**手写客户端**、零新增依赖（Spring AI 1.1.8 依赖 Boot 3.5，与本项目的 Boot 4 不兼容） |
+| DeepSeek（OpenAI 兼容端点） | `deepseek-chat` | AI 监控 Agent 的推理。**手写客户端**、零新增依赖（历史决策：当时 Spring AI 1.x 仅支持 Boot 3.5；2026-06 发布的 Spring AI 2.0 GA 已基于 Boot 4 / Framework 7 / Java 21，理论可替换，尚未迁移） |
 | Lombok | — | 样板代码 |
 
 ## 2. 整体架构与请求链路

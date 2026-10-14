@@ -96,7 +96,7 @@
     </appender>
 
     <!-- 文件写入放到独立线程：一次磁盘抖动不该让请求线程等 IO。
-         注意队列深度 4096 与 neverBlock=false：队列满时 AsyncAppender 会
+         注意队列深度 4096 与 neverBlock=true：队列满时 AsyncAppender 会
          丢弃 TRACE/DEBUG/INFO 并保留 WARN/ERROR（它按级别从低到高丢），
          这正是我们想要的方向 —— 宁可少 INFO，不可少 ERROR。 -->
     <appender name="ASYNC_FILE" class="ch.qos.logback.classic.AsyncAppender">
